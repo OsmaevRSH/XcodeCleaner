@@ -25,6 +25,8 @@ public struct CommandError: Error, Equatable, Sendable {
 }
 
 public protocol CommandRunning: Sendable {
+    /// - Parameter onOutputLine: May be called concurrently from the stdout and stderr readers;
+    ///   implementations must be thread-safe.
     func run(
         _ executable: String,
         _ arguments: [String],
@@ -52,7 +54,12 @@ public extension CommandRunning {
         currentDirectory: URL,
         onOutputLine: @escaping @Sendable (String) -> Void
     ) async throws -> CommandResult {
-        try await run(executable, arguments, currentDirectory: currentDirectory, onOutputLine: onOutputLine)
+        try await run(
+            executable,
+            arguments,
+            currentDirectory: Optional(currentDirectory),
+            onOutputLine: Optional(onOutputLine)
+        )
     }
 }
 
@@ -63,7 +70,7 @@ public struct ExecutableLocator: Sendable {
         self.searchDirectories = searchDirectories
     }
 
-    public static var standard: ExecutableLocator {
+    public static let standard: ExecutableLocator = {
         let fromEnvironment = (ProcessInfo.processInfo.environment["PATH"] ?? "")
             .split(separator: ":")
             .map(String.init)
@@ -71,10 +78,10 @@ public struct ExecutableLocator: Sendable {
         var seen = Set<String>()
         let merged = (wellKnown + fromEnvironment).filter { seen.insert($0).inserted }
         return ExecutableLocator(searchDirectories: merged)
-    }
+    }()
 
     public func resolve(_ name: String) -> String? {
-        if name.hasPrefix("/") {
+        if name.contains("/") {
             return FileManager.default.isExecutableFile(atPath: name) ? name : nil
         }
         for directory in searchDirectories {
@@ -116,33 +123,98 @@ public final class ProcessCommandRunner: CommandRunning {
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
-        do {
-            try process.run()
-        } catch {
-            throw CommandError(executable: executable, message: error.localizedDescription)
-        }
+        let processBox = ProcessBox(process: process)
 
-        async let stdoutText = Self.collect(stdoutPipe.fileHandleForReading, onOutputLine)
-        async let stderrText = Self.collect(stderrPipe.fileHandleForReading, onOutputLine)
-        let stdout = await stdoutText
-        let stderr = await stderrText
-        process.waitUntilExit()
-        return CommandResult(exitCode: process.terminationStatus, stdout: stdout, stderr: stderr)
+        return try await withTaskCancellationHandler {
+            try await Self.runAndCollect(
+                process: process,
+                executable: executable,
+                stdoutPipe: stdoutPipe,
+                stderrPipe: stderrPipe,
+                onOutputLine: onOutputLine
+            )
+        } onCancel: {
+            processBox.process.terminate()
+        }
     }
 
+    /// Not Sendable itself, but only ever touched from the `onCancel` closure of
+    /// `withTaskCancellationHandler`, which cannot run concurrently with the rest of `run`.
+    private final class ProcessBox: @unchecked Sendable {
+        let process: Process
+
+        init(process: Process) {
+            self.process = process
+        }
+    }
+
+    private static func runAndCollect(
+        process: Process,
+        executable: String,
+        stdoutPipe: Pipe,
+        stderrPipe: Pipe,
+        onOutputLine: (@Sendable (String) -> Void)?
+    ) async throws -> CommandResult {
+        // Draining must start before we await process termination: pipes have a 64KB buffer,
+        // and a process that fills it while nobody is reading will block forever, which would
+        // in turn block termination and deadlock this function.
+        async let stdoutText = collect(stdoutPipe.fileHandleForReading, onOutputLine)
+        async let stderrText = collect(stderrPipe.fileHandleForReading, onOutputLine)
+
+        let exitCode = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Int32, Error>) in
+            process.terminationHandler = { finishedProcess in
+                continuation.resume(returning: finishedProcess.terminationStatus)
+            }
+            do {
+                try process.run()
+            } catch {
+                process.terminationHandler = nil
+                continuation.resume(throwing: CommandError(executable: executable, message: error.localizedDescription))
+            }
+        }
+
+        do {
+            let stdout = try await stdoutText
+            let stderr = try await stderrText
+            return CommandResult(exitCode: exitCode, stdout: stdout, stderr: stderr)
+        } catch {
+            throw CommandError(executable: executable, message: "\(error)")
+        }
+    }
+
+    // `FileHandle.bytes.lines` deadlocks when two instances are iterated concurrently (as two
+    // sibling tasks/`async let` bindings draining stdout and stderr at once) — verified this hangs
+    // indefinitely even on trivial output. Read with the throwing, non-async `read(upToCount:)`
+    // API on a dedicated background queue instead, bridged to async via a checked continuation.
     private static func collect(
         _ handle: FileHandle,
         _ onOutputLine: (@Sendable (String) -> Void)?
-    ) async -> String {
-        var lines: [String] = []
-        do {
-            for try await line in handle.bytes.lines {
-                lines.append(line)
-                onOutputLine?(line)
+    ) async throws -> String {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    var lines: [String] = []
+                    var pending = Data()
+                    while let chunk = try handle.read(upToCount: 65536), chunk.isEmpty == false {
+                        pending.append(chunk)
+                        while let newlineIndex = pending.firstIndex(of: UInt8(ascii: "\n")) {
+                            let lineData = pending[pending.startIndex..<newlineIndex]
+                            let line = String(decoding: lineData, as: UTF8.self)
+                            lines.append(line)
+                            onOutputLine?(line)
+                            pending.removeSubrange(pending.startIndex...newlineIndex)
+                        }
+                    }
+                    if pending.isEmpty == false {
+                        let line = String(decoding: pending, as: UTF8.self)
+                        lines.append(line)
+                        onOutputLine?(line)
+                    }
+                    continuation.resume(returning: lines.joined(separator: "\n"))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
             }
-        } catch {
-            lines.append("[read error] \(error.localizedDescription)")
         }
-        return lines.joined(separator: "\n")
     }
 }

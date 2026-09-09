@@ -25,7 +25,7 @@ final class DirectorySizerTests: XCTestCase {
 
         let size = DirectorySizer.size(of: temp.url)
 
-        XCTAssertLessThan(size, 100_000)
+        XCTAssertTrue((1_000..<10_000).contains(size))
     }
 
     func test_missingPathIsZero() {

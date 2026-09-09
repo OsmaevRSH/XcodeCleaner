@@ -14,6 +14,10 @@ public enum ByteFormatting {
         if unitIndex == 0 {
             return "\(sign)\(Int(value)) \(units[unitIndex])"
         }
+        if value.rounded() >= 1024, unitIndex < units.count - 1 {
+            value /= 1024
+            unitIndex += 1
+        }
         return String(format: "%@%.2f %@", sign, value, units[unitIndex])
     }
 }
