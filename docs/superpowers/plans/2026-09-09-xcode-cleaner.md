@@ -206,6 +206,7 @@ git commit -m "Scaffold SwiftPM package with ByteFormatting"
 **Files:**
 - Create: `Sources/XcodeCleanerCore/CommandRunner.swift`
 - Create: `Tests/XcodeCleanerCoreTests/Support/FakeCommandRunner.swift`
+- Create: `Tests/XcodeCleanerCoreTests/Support/LineCollector.swift`
 - Create: `Tests/XcodeCleanerCoreTests/CommandRunnerTests.swift`
 
 - [ ] **Step 1: Падающие тесты**
@@ -260,12 +261,26 @@ final class CommandRunnerTests: XCTestCase {
         XCTAssertNil(locator.resolve("no-such-binary-xyz"))
     }
 }
+```
 
-private final class LineCollector: @unchecked Sendable {
+`Tests/XcodeCleanerCoreTests/Support/LineCollector.swift` (потокобезопасный сборщик строк лога, нужен потому, что `@Sendable`-замыкание не может мутировать захваченный `var`):
+
+```swift
+import Foundation
+
+final class LineCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [String] = []
+
     var lines: [String] { lock.withLock { storage } }
-    func append(_ line: String) { lock.withLock { storage.append(line) } }
+
+    func append(_ line: String) {
+        lock.withLock { storage.append(line) }
+    }
+
+    func contains(_ fragment: String) -> Bool {
+        lines.contains { $0.contains(fragment) }
+    }
 }
 ```
 
@@ -1853,14 +1868,20 @@ final class ArcMountsTests: XCTestCase {
         let temp = try TemporaryDirectory()
         defer { temp.remove() }
         let runner = FakeCommandRunner()
-        let manager = makeManager(runner, home: temp.url)
-        runner.respond(to: "arc mount --list --json", stdout: listJSON)
+        let mainMount = temp.url.appendingPathComponent("arcadia").path
+        runner.respond(
+            to: "arc mount --list --json",
+            stdout: """
+            [{"status":"mounted","mount":"\(mainMount)","store":"/store","object-store":"/store/.arc/objects"}]
+            """
+        )
+        let manager = ArcMountManager(runner: runner, home: temp.url)
 
         let path = try await manager.mountNew(name: "SAFTIOS-9") { _ in }
 
         XCTAssertEqual(path.path, temp.url.appendingPathComponent("arcadia_SAFTIOS-9").path)
         XCTAssertTrue(FileManager.default.fileExists(atPath: path.path))
-        XCTAssertEqual(runner.callLines.last, "arc mount -m \(path.path) --object-store /Users/tester/store/.arc/objects --override-object-store")
+        XCTAssertEqual(runner.callLines.last, "arc mount -m \(path.path) --object-store /store/.arc/objects --override-object-store")
     }
 
     func test_mountNewRefusesNonEmptyDirectory() async throws {
@@ -1932,13 +1953,13 @@ final class ArcMountsTests: XCTestCase {
         let runner = FakeCommandRunner()
         let manager = ArcMountManager(runner: runner, home: temp.url)
         let mount = ArcMount(status: .unmounted, mount: mountDir.path, store: "/s", objectStore: "/o")
-        var logged: [String] = []
+        let logged = LineCollector()
 
         try await manager.forget(mount) { logged.append($0) }
 
         XCTAssertEqual(runner.callLines, ["arc unmount --forget \(mountDir.path)"])
         XCTAssertTrue(FileManager.default.fileExists(atPath: mountDir.path))
-        XCTAssertTrue(logged.contains { $0.contains("не пуста") })
+        XCTAssertTrue(logged.contains("не пуста"))
     }
 
     func test_forgetRefusesMainMount() async {
@@ -2453,7 +2474,7 @@ final class CleanerTests: XCTestCase {
             CleanupItem(id: "bad", kind: .projectCaches, title: "", subtitle: "", action: .clearContents(notAllowed), sizeBytes: nil, isDestructive: false),
             CleanupItem(id: "archive", kind: .archives, title: "", subtitle: "", action: .trash(archive), sizeBytes: nil, isDestructive: true),
         ]
-        var logged: [String] = []
+        let logged = LineCollector()
 
         let report = try await cleaner.run(items) { logged.append($0) }
 
@@ -2474,7 +2495,7 @@ final class CleanerTests: XCTestCase {
             "xcrun simctl runtime delete all",
         ])
         XCTAssertEqual(runner.callLines.last, "sync")
-        XCTAssertTrue(logged.contains { $0.contains("NotAllowed") })
+        XCTAssertTrue(logged.contains("NotAllowed"))
     }
 
     func test_eraseAllModeUsesEraseCommand() async throws {
@@ -2573,7 +2594,7 @@ public struct Scanner: Sendable {
             clearableDirectories: cachePaths.allClearable
                 + ProjectCacheScanner.allowedDirectories(mounts: result.mounts, cachePaths: cachePaths),
             trashableParents: [cachePaths.applicationsDirectory, cachePaths.toolchainsDirectory]
-                + Set(result.archives.map { $0.url.deletingLastPathComponent() })
+                + Array(Set(result.archives.map { $0.url.deletingLastPathComponent() }))
         )
     }
 
@@ -3680,4 +3701,5 @@ git commit -m "Add build script and README"
 
 - **Spec coverage:** шапка диска (Task 15 DiskHeaderView, `bytesToFree` в Task 14); восемь категорий (Tasks 6, 7, 8, 9, 11); Arcadia mount/unmount/forget (Task 10, 14, 15); лог в файл (Task 12, 14); подтверждение с чекбоксом (Task 15 ConfirmSheet); allowlist и нет `rm -rf` (Task 5); Корзина для Archives/Xcode/toolchains (Task 13 `.trash`); проверка запущенных процессов (Task 12, 13); порядок выполнения (Task 13 `ordered`, `shutdown all` первым); тесты на фикстурах и фейковом runner (Tasks 2–13); `build.sh` (Task 16).
 - **Type consistency:** `CleanupItem.Action` (`clearContents`, `trash`, `simulators`) используется одинаково в Tasks 6, 7, 8, 9, 13, 14. `ArcMountInfo(mount:storeSizeBytes:isMain:sharesMainObjectStore:)` совпадает в Tasks 10, 11, 14, 15. `Cleaner.run(_:log:)` и `ArcMountManager.mountNew/unmount/forget(…, log:)` принимают `@Sendable (String) -> Void`; в AppModel передаётся замыкание с `Task { @MainActor in }`.
+- **Известное ограничение:** размер store для двух десятков маунтов считается обходом `~/.arc/stores` (около 100 GB мелких файлов), первый скан может занять минуту; результат показывается по завершении, UI не блокируется.
 - **Известное ограничение:** `Table` не умеет запрещать выбор отдельной строки, поэтому основной маунт защищён в модели (`selectedMounts` исключает `isMain`, `forget` бросает `mainMountProtected`).
