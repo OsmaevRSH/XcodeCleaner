@@ -49,8 +49,8 @@ public struct Cleaner: Sendable {
 
     private let runner: any CommandRunning
     private let deleter: SafeDeleter
-    // Only `FileManager.default` is ever injected here, and Apple documents the shared instance as
-    // thread-safe. A caller-supplied `FileManager` carrying a delegate would not be.
+    // Any injected `FileManager` must be thread-safe (the shared default instance is); it is only
+    // read.
     private nonisolated(unsafe) let fileManager: FileManager
     private let home: URL
 
@@ -67,9 +67,13 @@ public struct Cleaner: Sendable {
     }
 
     public func run(_ items: [CleanupItem], log: @escaping Log) async throws -> CleanupReport {
-        let blocking = try await RunningAppsCheck(runner: runner).blockingProcesses()
-        guard blocking.isEmpty else {
-            throw CleanerError.blockingProcesses(blocking)
+        // A run cancelled before it starts must not spawn `pgrep`, shut simulators down or delete
+        // anything; it still reports so the caller sees the (empty) outcome and the disk figures.
+        if Task.isCancelled == false {
+            let blocking = try await RunningAppsCheck(runner: runner).blockingProcesses()
+            guard blocking.isEmpty else {
+                throw CleanerError.blockingProcesses(blocking)
+            }
         }
 
         let ordered = Self.ordered(items)
@@ -82,12 +86,15 @@ public struct Cleaner: Sendable {
         // Booted simulators keep their data directories busy, so every simulator-touching run
         // shuts them down once up front rather than per item.
         let touchesSimulators = ordered.contains { $0.kind == .simulators || $0.kind == .simulatorCaches }
-        if touchesSimulators {
+        if touchesSimulators, Task.isCancelled == false {
             _ = await simctl(["shutdown", "all"], log: log)
         }
 
         var results: [ItemResult] = []
         for item in ordered {
+            if Task.isCancelled {
+                break
+            }
             log("→ \(item.kind.title): \(item.title)")
             let result = await perform(item, log: log)
             if let message = result.message {
@@ -96,6 +103,9 @@ public struct Cleaner: Sendable {
             results.append(result)
         }
 
+        if Task.isCancelled {
+            log("Прервано пользователем")
+        }
         _ = try? await runner.run("sync", [])
         let diskAfter = try? DiskSpace.current(for: home)
         let report = CleanupReport(diskBefore: diskBefore, diskAfter: diskAfter, results: results)
@@ -123,14 +133,14 @@ public struct Cleaner: Sendable {
                     message: failures.isEmpty ? nil : "\(failures.count) объектов не удалено"
                 )
             } catch {
-                return ItemResult(itemID: item.id, succeeded: false, message: "\(directory.path): \(error)")
+                return ItemResult(itemID: item.id, succeeded: false, message: error.localizedDescription)
             }
         case let .trash(url):
             do {
                 try deleter.trash(url, fileManager: fileManager)
                 return ItemResult(itemID: item.id, succeeded: true, message: "в Корзину")
             } catch {
-                return ItemResult(itemID: item.id, succeeded: false, message: "\(url.path): \(error)")
+                return ItemResult(itemID: item.id, succeeded: false, message: error.localizedDescription)
             }
         case let .simulators(mode):
             return await performSimulators(mode, itemID: item.id, log: log)
@@ -174,11 +184,21 @@ public struct Cleaner: Sendable {
         do {
             let result = try await runner.run("xcrun", ["simctl"] + arguments, onOutputLine: { log("    \($0)") })
             guard result.succeeded else {
-                return "\(label): \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
+                return "\(label): \(Self.failureDetails(result))"
             }
             return nil
         } catch {
-            return "\(label): \(error)"
+            return "\(label): \(error.localizedDescription)"
         }
+    }
+
+    /// `simctl` reports some refusals with an exit code and nothing on stderr, which would leave
+    /// the user with a bare "simctl delete unavailable:" and no way to tell what went wrong.
+    private static func failureDetails(_ result: CommandResult) -> String {
+        if result.terminatedBySignal {
+            return "killed by signal \(result.exitCode)"
+        }
+        let stderr = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        return stderr.isEmpty ? "exit \(result.exitCode)" : stderr
     }
 }

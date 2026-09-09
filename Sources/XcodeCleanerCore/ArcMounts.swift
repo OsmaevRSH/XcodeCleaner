@@ -50,19 +50,24 @@ public struct ArcMountInfo: Sendable, Equatable, Identifiable, Hashable {
     public var id: String { mount.id }
 }
 
-public enum ArcMountError: Error, Equatable, Sendable {
+public enum ArcMountError: Error, Equatable, Sendable, LocalizedError {
     case invalidName(String)
     case directoryNotEmpty(String)
     case mainMountNotFound
     case mainMountProtected
     case refusedPath(String)
     case commandFailed(String, String)
-}
 
-/// `FileManager` is not `Sendable`, but only the shared instance — documented as thread-safe —
-/// is ever handed to the sizing tasks, so it crosses task boundaries in an explicit box.
-private struct UncheckedFileManager: @unchecked Sendable {
-    let value: FileManager
+    public var errorDescription: String? {
+        switch self {
+        case let .invalidName(name): "Недопустимое имя маунта: \"\(name)\""
+        case let .directoryNotEmpty(path): "Папка уже существует и не пуста: \(path)"
+        case .mainMountNotFound: "Основной маунт ~/arcadia не найден"
+        case .mainMountProtected: "Основной маунт ~/arcadia удалить нельзя"
+        case let .refusedPath(path): "Небезопасный путь маунта, удаление отклонено: \(path)"
+        case let .commandFailed(command, stderr): "\(command) завершилась с ошибкой: \(stderr)"
+        }
+    }
 }
 
 public struct ArcMountManager: Sendable {
@@ -70,8 +75,8 @@ public struct ArcMountManager: Sendable {
 
     private let runner: any CommandRunning
     private let home: URL
-    // Only `FileManager.default` is ever injected here, and Apple documents the shared instance as
-    // thread-safe. A caller-supplied `FileManager` carrying a delegate would not be.
+    // Any injected `FileManager` must be thread-safe (the shared default instance is); it is only
+    // read.
     private nonisolated(unsafe) let fileManager: FileManager
 
     public init(runner: any CommandRunning, home: URL, fileManager: FileManager = .default) {
@@ -120,16 +125,14 @@ public struct ArcMountManager: Sendable {
     /// only for the mounts that can actually be forgotten. The main mount is skipped entirely.
     public func storeSizes(for mounts: [ArcMount]) async -> [String: Int64] {
         let main = Self.canonical(mainMountPath)
-        let sizing = UncheckedFileManager(value: fileManager)
         return await withTaskGroup(of: (String, Int64).self) { group in
             for mount in mounts where Self.canonical(mount.mount) != main {
                 let key = mount.mount
                 let store = mount.store
-                group.addTask {
-                    let size = await Task.detached(priority: .utility) {
-                        DirectorySizer.size(of: URL(fileURLWithPath: store), fileManager: sizing.value)
-                    }.value
-                    return (key, size)
+                // A freshly created `FileManager` is owned by the child task alone, so nothing has
+                // to cross an isolation boundary and `group.cancelAll()` reaches the walk itself.
+                group.addTask(priority: .utility) {
+                    (key, DirectorySizer.size(of: URL(fileURLWithPath: store), fileManager: FileManager()))
                 }
             }
             var sizes: [String: Int64] = [:]

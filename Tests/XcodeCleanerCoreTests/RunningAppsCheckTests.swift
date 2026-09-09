@@ -57,4 +57,20 @@ final class RunningAppsCheckTests: XCTestCase {
             XCTFail("unexpected \(error)")
         }
     }
+
+    func test_pgrepKilledBySignalIsThrown() async {
+        let runner = FakeCommandRunner()
+        runner.defaultResult = CommandResult(exitCode: 1, stdout: "", stderr: "", terminatedBySignal: true)
+        let check = RunningAppsCheck(runner: runner)
+
+        do {
+            _ = try await check.blockingProcesses()
+            XCTFail("expected throw")
+        } catch let error as CommandError {
+            XCTAssertEqual(error.executable, "pgrep")
+            XCTAssertEqual(error.message, "killed by signal 1")
+        } catch {
+            XCTFail("unexpected \(error)")
+        }
+    }
 }

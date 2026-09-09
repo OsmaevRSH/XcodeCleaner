@@ -25,6 +25,9 @@ public struct RunningAppsCheck: Sendable {
             } catch {
                 throw CommandError(executable: "pgrep", message: "\(error)")
             }
+            if result.terminatedBySignal {
+                throw CommandError(executable: "pgrep", message: "killed by signal \(result.exitCode)")
+            }
             switch result.exitCode {
             case 0:
                 running.append(name)

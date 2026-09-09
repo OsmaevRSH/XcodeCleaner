@@ -264,23 +264,8 @@ final class AppModel {
         defer { isWorking = false }
         do {
             try await body()
-        } catch let error as ArcMountError {
-            errorMessage = describe(error)
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription ?? "\(error)"
-        }
-    }
-
-    /// `ArcMountError` carries no `LocalizedError` conformance, so the user-facing wording lives
-    /// here rather than in the core library.
-    private func describe(_ error: ArcMountError) -> String {
-        switch error {
-        case let .invalidName(name): "Недопустимое имя маунта: \"\(name)\""
-        case let .directoryNotEmpty(path): "Папка уже существует и не пуста: \(path)"
-        case .mainMountNotFound: "Основной маунт ~/arcadia не найден"
-        case .mainMountProtected: "Основной маунт ~/arcadia удалить нельзя"
-        case let .refusedPath(path): "Небезопасный путь маунта, удаление отклонено: \(path)"
-        case let .commandFailed(command, stderr): "\(command) завершилась с ошибкой: \(stderr)"
         }
     }
 

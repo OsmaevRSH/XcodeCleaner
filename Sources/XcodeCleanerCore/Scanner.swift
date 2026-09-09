@@ -14,17 +14,11 @@ public struct ScanResult: Sendable, Equatable {
     public init() {}
 }
 
-/// `FileManager` is not `Sendable`, but only the shared instance — documented as thread-safe — is
-/// ever handed to the sizing tasks, so it crosses task boundaries in an explicit box.
-private struct ScannerFileManager: @unchecked Sendable {
-    let value: FileManager
-}
-
 public struct Scanner: Sendable {
     private let runner: any CommandRunning
     private let cachePaths: CachePaths
-    // Only `FileManager.default` is ever injected here, and Apple documents the shared instance as
-    // thread-safe. A caller-supplied `FileManager` carrying a delegate would not be.
+    // Any injected `FileManager` must be thread-safe (the shared default instance is); it is only
+    // read.
     private nonisolated(unsafe) let fileManager: FileManager
 
     public init(runner: any CommandRunning, cachePaths: CachePaths, fileManager: FileManager = .default) {
@@ -33,26 +27,21 @@ public struct Scanner: Sendable {
         self.fileManager = fileManager
     }
 
-    /// `DirectorySizer` walks whole trees synchronously, so every sizing pass runs on a detached
-    /// utility task: on the cooperative pool a single `DerivedData` scan would occupy a core for
-    /// seconds and stall the other scanners that are supposed to run alongside it.
+    /// Every sizing pass runs in a child task so that cancelling the scan reaches the tree walks:
+    /// `DirectorySizer` polls `Task.isCancelled`, which a detached task would never observe. Each
+    /// concurrent walk gets its own `FileManager` instead of sharing the stored one.
     public func scan() async -> ScanResult {
         var result = ScanResult()
         result.disk = try? DiskSpace.current(for: cachePaths.home)
 
         let paths = cachePaths
-        let files = ScannerFileManager(value: fileManager)
 
-        let cachesTask = Task.detached(priority: .utility) {
-            Self.cacheItems(cachePaths: paths, fileManager: files.value)
-        }
-        let archivesTask = Task.detached(priority: .utility) {
-            ArchiveScanner.archives(in: paths.archivesDirectory, fileManager: files.value)
-        }
-        let toolchainsTask = Task.detached(priority: .utility) {
-            XcodeInstallationScanner.toolchains(in: paths.toolchainsDirectory, fileManager: files.value)
-        }
-
+        async let caches = Self.cacheItems(cachePaths: paths, fileManager: FileManager())
+        async let archives = ArchiveScanner.archives(in: paths.archivesDirectory, fileManager: FileManager())
+        async let toolchains = XcodeInstallationScanner.toolchains(
+            in: paths.toolchainsDirectory,
+            fileManager: FileManager()
+        )
         async let simulators = scanSimulators()
         async let xcodes = scanXcodes()
         async let mounts = scanMounts()
@@ -64,16 +53,20 @@ public struct Scanner: Sendable {
         let (mountInfos, mountWarning) = await mounts
         result.mounts = mountInfos
 
-        result.cacheItems = await cachesTask.value
-        result.archives = await archivesTask.value
-        result.toolchains = await toolchainsTask.value
-        result.projectCacheItems = await Task.detached(priority: .utility) {
-            ProjectCacheScanner.items(mounts: mountInfos, cachePaths: paths, fileManager: files.value)
-        }.value
+        result.cacheItems = await caches
+        result.archives = await archives
+        result.toolchains = await toolchains
 
-        let symlinked = CacheItemBuilder.symlinkedDirectories(cachePaths.allClearable, fileManager: fileManager)
-        let symlinkWarnings = symlinked.map { "Пропущено, путь проходит через симлинк: \($0.path)" }
-        result.warnings = [simulatorWarning, xcodeWarning, mountWarning].compactMap { $0 } + symlinkWarnings
+        let projectDirectories = ProjectCacheScanner.allowedDirectories(mounts: mountInfos, cachePaths: paths)
+        async let projectItems = CacheItemBuilder.items(
+            kind: .projectCaches,
+            directories: projectDirectories,
+            fileManager: FileManager()
+        )
+        result.projectCacheItems = await projectItems
+
+        result.warnings = [simulatorWarning, xcodeWarning, mountWarning].compactMap { $0 }
+            + symlinkWarnings(projectDirectories: projectDirectories)
         return result
     }
 
@@ -88,6 +81,17 @@ public struct Scanner: Sendable {
         )
     }
 
+    /// The directories the item builders silently drop because they sit on or behind a symlink,
+    /// reported once each even though the global project caches appear in both lists.
+    private func symlinkWarnings(projectDirectories: [URL]) -> [String] {
+        let skipped = CacheItemBuilder.symlinkedDirectories(cachePaths.allClearable, fileManager: fileManager)
+            + CacheItemBuilder.symlinkedDirectories(projectDirectories, fileManager: fileManager)
+        var seen = Set<String>()
+        return skipped
+            .filter { seen.insert($0.path).inserted }
+            .map { "Пропущено, путь проходит через симлинк: \($0.path)" }
+    }
+
     private static func cacheItems(cachePaths: CachePaths, fileManager: FileManager) -> [CleanupItem] {
         CacheItemBuilder.items(kind: .xcodeCaches, directories: cachePaths.xcodeCaches, fileManager: fileManager)
             + CacheItemBuilder.items(kind: .deviceSupport, directories: cachePaths.deviceSupport, fileManager: fileManager)
@@ -97,8 +101,10 @@ public struct Scanner: Sendable {
     private func scanSimulators() async -> (SimulatorInventory?, String?) {
         do {
             return (try await SimulatorScanner(runner: runner).inventory(), nil)
+        } catch is CancellationError {
+            return (nil, nil)
         } catch {
-            return (nil, "Симуляторы недоступны: \(error)")
+            return (nil, "Симуляторы недоступны: \(error.localizedDescription)")
         }
     }
 
@@ -106,17 +112,16 @@ public struct Scanner: Sendable {
         do {
             let active = try await XcodeInstallationScanner.activeDeveloperDir(runner: runner)
             let applications = cachePaths.applicationsDirectory
-            let files = ScannerFileManager(value: fileManager)
-            let installations = await Task.detached(priority: .utility) {
-                XcodeInstallationScanner.installations(
-                    in: applications,
-                    activeDeveloperDir: active,
-                    fileManager: files.value
-                )
-            }.value
-            return (installations, nil)
+            async let installations = XcodeInstallationScanner.installations(
+                in: applications,
+                activeDeveloperDir: active,
+                fileManager: FileManager()
+            )
+            return (await installations, nil)
+        } catch is CancellationError {
+            return ([], nil)
         } catch {
-            return ([], "xcode-select недоступен: \(error)")
+            return ([], "xcode-select недоступен: \(error.localizedDescription)")
         }
     }
 
@@ -124,8 +129,10 @@ public struct Scanner: Sendable {
         do {
             let manager = ArcMountManager(runner: runner, home: cachePaths.home, fileManager: fileManager)
             return (try await manager.list(), nil)
+        } catch is CancellationError {
+            return ([], nil)
         } catch {
-            return ([], "arc недоступен: \(error)")
+            return ([], "arc недоступен: \(error.localizedDescription)")
         }
     }
 }

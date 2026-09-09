@@ -18,7 +18,7 @@ public struct CommandResult: Sendable, Equatable {
     public var succeeded: Bool { exitCode == 0 }
 }
 
-public struct CommandError: Error, Equatable, Sendable {
+public struct CommandError: Error, Equatable, Sendable, LocalizedError {
     public let executable: String
     public let message: String
 
@@ -26,6 +26,8 @@ public struct CommandError: Error, Equatable, Sendable {
         self.executable = executable
         self.message = message
     }
+
+    public var errorDescription: String? { "\(executable): \(message)" }
 }
 
 public protocol CommandRunning: Sendable {

@@ -29,9 +29,20 @@ final class FakeCommandRunner: CommandRunning, @unchecked Sendable {
         set { lock.withLock { storedErrorToThrow = newValue } }
     }
 
-    func respond(to line: String, stdout: String = "", stderr: String = "", exitCode: Int32 = 0) {
+    func respond(
+        to line: String,
+        stdout: String = "",
+        stderr: String = "",
+        exitCode: Int32 = 0,
+        terminatedBySignal: Bool = false
+    ) {
         lock.withLock {
-            storedResponses[line] = CommandResult(exitCode: exitCode, stdout: stdout, stderr: stderr)
+            storedResponses[line] = CommandResult(
+                exitCode: exitCode,
+                stdout: stdout,
+                stderr: stderr,
+                terminatedBySignal: terminatedBySignal
+            )
         }
     }
 

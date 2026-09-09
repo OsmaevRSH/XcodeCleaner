@@ -24,7 +24,12 @@ public enum DirectorySizer {
             return 0
         }
         var total: Int64 = 0
+        var visited = 0
         for case let child as URL in enumerator {
+            visited += 1
+            if visited % 256 == 0, Task.isCancelled {
+                return total
+            }
             total += fileSize(child)
         }
         return total

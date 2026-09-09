@@ -104,6 +104,69 @@ final class CleanerTests: XCTestCase {
         XCTAssertEqual(report.results[0].message, "simctl delete unavailable: boom")
     }
 
+    func test_clearContentsFailureMessageUsesDeleterDescription() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let notAllowed = try temp.makeDirectory("NotAllowed")
+        let runner = idleRunner()
+        let cleaner = Cleaner(runner: runner, deleter: SafeDeleter(clearableDirectories: [], trashableParents: []), home: temp.url)
+        let item = CleanupItem(id: "bad", kind: .projectCaches, title: "", subtitle: "", action: .clearContents(notAllowed), sizeBytes: nil, isDestructive: false)
+
+        let report = try await cleaner.run([item]) { _ in }
+
+        XCTAssertEqual(report.results[0].succeeded, false)
+        XCTAssertEqual(
+            report.results[0].message,
+            SafeDeleterError.notAllowed(notAllowed.path).localizedDescription
+        )
+    }
+
+    func test_simctlFailureWithoutStderrReportsExitCode() async throws {
+        let runner = idleRunner()
+        runner.respond(to: "xcrun simctl delete unavailable", exitCode: 1)
+        let cleaner = Cleaner(runner: runner, deleter: SafeDeleter(clearableDirectories: [], trashableParents: []), home: FileManager.default.temporaryDirectory)
+        let item = CleanupItem(id: "sim", kind: .simulators, title: "", subtitle: "", action: .simulators(.deleteUnavailable), sizeBytes: nil, isDestructive: false)
+
+        let report = try await cleaner.run([item]) { _ in }
+
+        XCTAssertEqual(report.results[0].message, "simctl delete unavailable: exit 1")
+    }
+
+    func test_simctlKilledBySignalIsReportedAsSignal() async throws {
+        let runner = idleRunner()
+        runner.respond(to: "xcrun simctl delete unavailable", exitCode: 9, terminatedBySignal: true)
+        let cleaner = Cleaner(runner: runner, deleter: SafeDeleter(clearableDirectories: [], trashableParents: []), home: FileManager.default.temporaryDirectory)
+        let item = CleanupItem(id: "sim", kind: .simulators, title: "", subtitle: "", action: .simulators(.deleteUnavailable), sizeBytes: nil, isDestructive: false)
+
+        let report = try await cleaner.run([item]) { _ in }
+
+        XCTAssertEqual(report.results[0].message, "simctl delete unavailable: killed by signal 9")
+    }
+
+    func test_cancelledRunStopsBeforeTouchingAnything() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let cache = try temp.makeDirectory("DerivedData")
+        let junk = try temp.makeFile("DerivedData/junk", bytes: 10)
+        let runner = idleRunner()
+        let deleter = SafeDeleter(clearableDirectories: [cache], trashableParents: [])
+        let cleaner = Cleaner(runner: runner, deleter: deleter, home: temp.url)
+        let items = [
+            CleanupItem(id: "cache", kind: .xcodeCaches, title: "", subtitle: "", action: .clearContents(cache), sizeBytes: nil, isDestructive: false),
+            CleanupItem(id: "sim", kind: .simulators, title: "", subtitle: "", action: .simulators(.deleteAll), sizeBytes: nil, isDestructive: true),
+        ]
+        let logged = LineCollector()
+
+        let task = Task { try await cleaner.run(items) { logged.append($0) } }
+        task.cancel()
+        let report = try await task.value
+
+        XCTAssertLessThan(report.results.count, items.count)
+        XCTAssertFalse(runner.callLines.contains { $0.hasPrefix("xcrun simctl delete") })
+        XCTAssertTrue(logged.contains("Прервано пользователем"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: junk.path))
+    }
+
     func test_makeDeleterAllowsArchiveDayFoldersAndMountedProjectCaches() {
         let paths = CachePaths(home: URL(fileURLWithPath: "/Users/tester"))
         let scanner = Scanner(runner: FakeCommandRunner(), cachePaths: paths)
