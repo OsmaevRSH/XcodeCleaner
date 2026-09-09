@@ -394,7 +394,12 @@ public extension CommandRunning {
         currentDirectory: URL,
         onOutputLine: @escaping @Sendable (String) -> Void
     ) async throws -> CommandResult {
-        try await run(executable, arguments, currentDirectory: currentDirectory, onOutputLine: onOutputLine)
+        try await run(
+            executable,
+            arguments,
+            currentDirectory: Optional(currentDirectory),
+            onOutputLine: Optional(onOutputLine)
+        )
     }
 }
 
