@@ -12,9 +12,21 @@ public struct SimulatorRuntime: Sendable, Equatable, Decodable {
     public let identifier: String
     public let runtimeIdentifier: String
     public let version: String
-    public let platformIdentifier: String
-    public let sizeBytes: Int64
-    public let deletable: Bool
+    public let platformIdentifier: String?
+    private let rawSizeBytes: Int64?
+    private let rawDeletable: Bool?
+
+    public var sizeBytes: Int64 { rawSizeBytes ?? 0 }
+    public var deletable: Bool { rawDeletable ?? false }
+
+    private enum CodingKeys: String, CodingKey {
+        case identifier
+        case runtimeIdentifier
+        case version
+        case platformIdentifier
+        case rawSizeBytes = "sizeBytes"
+        case rawDeletable = "deletable"
+    }
 }
 
 public struct SimulatorInventory: Sendable, Equatable {
@@ -29,7 +41,7 @@ public struct SimulatorInventory: Sendable, Equatable {
     public var availableDevices: [SimulatorDevice] { devices.filter(\.isAvailable) }
     public var unavailableDevices: [SimulatorDevice] { devices.filter { $0.isAvailable == false } }
     public var devicesDataSize: Int64 { devices.reduce(0) { $0 + ($1.dataPathSize ?? 0) } }
-    public var runtimesSize: Int64 { runtimes.reduce(0) { $0 + $1.sizeBytes } }
+    public var runtimesSize: Int64 { runtimes.filter(\.deletable).reduce(0) { $0 + $1.sizeBytes } }
 
     public func estimatedFreedBytes(for mode: SimulatorMode) -> Int64 {
         switch mode {
@@ -63,8 +75,8 @@ public struct SimulatorInventory: Sendable, Equatable {
         let devicesPayload = try decoder.decode(DevicesPayload.self, from: devicesJSON)
         let runtimesPayload = try decoder.decode([String: SimulatorRuntime].self, from: runtimesJSON)
         return SimulatorInventory(
-            devices: devicesPayload.devices.values.flatMap { $0 },
-            runtimes: Array(runtimesPayload.values)
+            devices: devicesPayload.devices.values.flatMap { $0 }.sorted { $0.udid < $1.udid },
+            runtimes: runtimesPayload.values.sorted { $0.identifier < $1.identifier }
         )
     }
 }

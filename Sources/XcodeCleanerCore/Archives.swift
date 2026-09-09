@@ -40,13 +40,13 @@ public enum ArchiveScanner {
                 continue
             }
             for child in children where child.pathExtension == "xcarchive" {
-                let created = (try? child.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
-                // `contentsOfDirectory` returns fully-resolved (e.g. `/private/var/...`) directory
-                // URLs with a trailing slash; normalize back to a plain file URL matching how
-                // callers construct archive URLs via `appendingPathComponent`.
-                let normalized = URL(fileURLWithPath: child.resolvingSymlinksInPath().path, isDirectory: false)
+                let created = (try? child.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
+                let url = XcodeInstallationScanner.entryURL(
+                    base: directory,
+                    components: [folder.lastPathComponent, child.lastPathComponent]
+                )
                 result.append(ArchiveEntry(
-                    url: normalized,
+                    url: url,
                     createdAt: created,
                     sizeBytes: DirectorySizer.size(of: child, fileManager: fileManager)
                 ))

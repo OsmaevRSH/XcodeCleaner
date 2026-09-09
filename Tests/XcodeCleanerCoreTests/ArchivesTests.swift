@@ -52,4 +52,13 @@ final class ArchivesTests: XCTestCase {
     func test_missingDirectoryYieldsEmpty() {
         XCTAssertEqual(ArchiveScanner.archives(in: URL(fileURLWithPath: "/nonexistent/\(UUID())")), [])
     }
+
+    func test_freshArchiveExcludedAtZeroDaysThreshold() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        _ = try makeArchive(temp, "2026-09-01/Fresh.xcarchive", daysAgo: 0)
+        let entry = ArchiveScanner.archives(in: temp.url)[0]
+
+        XCTAssertTrue(ArchiveScanner.olderThan(days: 0, now: entry.createdAt, [entry]).isEmpty)
+    }
 }

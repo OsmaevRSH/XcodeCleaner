@@ -51,6 +51,20 @@ public enum XcodeInstallationScanner {
         return result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Enumerator URLs can differ from caller-built URLs by trailing slash and, for `/var`-rooted
+    /// temp dirs, by a `/private` prefix; entries are anchored to the caller's base so allowlist
+    /// path comparison in `SafeDeleter` stays consistent.
+    static func entryURL(base: URL, components: [String]) -> URL {
+        let path = components.reduce(base) { $0.appendingPathComponent($1) }.path
+        return URL(fileURLWithPath: path, isDirectory: false)
+    }
+
+    private static func isXcodeAppName(_ url: URL) -> Bool {
+        guard url.pathExtension == "app" else { return false }
+        let stem = url.deletingPathExtension().lastPathComponent
+        return stem == "Xcode" || stem.hasPrefix("Xcode-") || stem.hasPrefix("Xcode ")
+    }
+
     public static func installations(
         in applications: URL,
         activeDeveloperDir: String,
@@ -63,19 +77,15 @@ public enum XcodeInstallationScanner {
         ) else {
             return []
         }
-        let activePath = URL(fileURLWithPath: activeDeveloperDir).standardizedFileURL.path
+        let activePath = URL(fileURLWithPath: activeDeveloperDir).resolvingSymlinksInPath().path
         return children
-            .filter { $0.lastPathComponent.hasPrefix("Xcode") && $0.pathExtension == "app" }
-            .filter { $0.lastPathComponent != "Xcodes.app" }
+            .filter(isXcodeAppName)
             .map { child in
-                // `contentsOfDirectory` resolves through `/private`; rebuild from the caller's own
-                // `applications` base so the URL compares equal to ones built via
-                // `appendingPathComponent` on that same (possibly non-`/private`) base.
-                let url = applications.appendingPathComponent(child.lastPathComponent)
-                let developer = url.appendingPathComponent("Contents/Developer").standardizedFileURL.path
+                let url = Self.entryURL(base: applications, components: [child.lastPathComponent])
+                let developerPath = url.appendingPathComponent("Contents/Developer").resolvingSymlinksInPath().path
                 return XcodeInstallation(
                     url: url,
-                    isActive: developer == activePath,
+                    isActive: developerPath == activePath,
                     sizeBytes: DirectorySizer.size(of: child, fileManager: fileManager)
                 )
             }
@@ -100,18 +110,12 @@ public enum XcodeInstallationScanner {
             let resolved = child.resolvingSymlinksInPath().standardizedFileURL.path
             let isLatestLink = child.lastPathComponent == "swift-latest.xctoolchain"
             let isLatestTarget = latestTarget == resolved
-            // `contentsOfDirectory` resolves through `/private` and, because the entry already
-            // exists on disk, `appendingPathComponent` also tags it with a directory-style
-            // trailing slash; rebuild as a plain file URL so it compares equal to ones callers
-            // build (before the directory exists) via `appendingPathComponent` on the same base.
-            let url = URL(
-                fileURLWithPath: directory.appendingPathComponent(child.lastPathComponent).path,
-                isDirectory: false
-            )
+            let isSymlink = (try? child.resourceValues(forKeys: [.isSymbolicLinkKey]))?.isSymbolicLink == true
+            let url = Self.entryURL(base: directory, components: [child.lastPathComponent])
             return ToolchainEntry(
                 url: url,
                 isProtected: isLatestLink || isLatestTarget,
-                sizeBytes: isLatestLink ? 0 : DirectorySizer.size(of: child, fileManager: fileManager)
+                sizeBytes: isSymlink ? 0 : DirectorySizer.size(of: child, fileManager: fileManager)
             )
         }
         .sorted { $0.name < $1.name }

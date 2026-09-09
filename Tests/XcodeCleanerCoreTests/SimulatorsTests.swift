@@ -43,6 +43,14 @@ final class SimulatorsTests: XCTestCase {
         "platformIdentifier" : "com.apple.platform.iphonesimulator",
         "sizeBytes" : 7000,
         "deletable" : true
+      },
+      "R3" : {
+        "identifier" : "R3",
+        "runtimeIdentifier" : "com.apple.CoreSimulator.SimRuntime.watchOS-11-0",
+        "version" : "11.0",
+        "platformIdentifier" : "com.apple.platform.watchsimulator",
+        "sizeBytes" : 9000,
+        "deletable" : false
       }
     }
     """.data(using: .utf8)!
@@ -50,9 +58,9 @@ final class SimulatorsTests: XCTestCase {
     func test_parsesDevicesAndRuntimes() throws {
         let inventory = try SimulatorInventory.parse(devicesJSON: devicesJSON, runtimesJSON: runtimesJSON)
 
-        XCTAssertEqual(inventory.devices.map(\.udid).sorted(), ["AAAA", "BBBB"])
+        XCTAssertEqual(inventory.devices.map(\.udid), ["AAAA", "BBBB"])
         XCTAssertEqual(inventory.unavailableDevices.map(\.udid), ["BBBB"])
-        XCTAssertEqual(inventory.runtimes.map(\.version).sorted(), ["17.5", "26.2"])
+        XCTAssertEqual(inventory.runtimes.map(\.identifier), ["R1", "R2", "R3"])
         XCTAssertEqual(inventory.devicesDataSize, 4500)
         XCTAssertEqual(inventory.runtimesSize, 15000)
     }
@@ -88,6 +96,64 @@ final class SimulatorsTests: XCTestCase {
         XCTAssertEqual(item.action, .simulators(.deleteAll))
         XCTAssertEqual(item.sizeBytes, 4500)
         XCTAssertTrue(item.isDestructive)
-        XCTAssertEqual(item.subtitle, "2 устройств, 1 недоступно, 2 runtimes")
+        XCTAssertEqual(item.subtitle, "2 устройств, 1 недоступно, 3 runtimes")
+    }
+
+    func test_runtimesSizeExcludesNonDeletableRuntimes() throws {
+        let inventory = try SimulatorInventory.parse(devicesJSON: devicesJSON, runtimesJSON: runtimesJSON)
+
+        XCTAssertEqual(inventory.runtimes.count, 3)
+        XCTAssertEqual(inventory.runtimesSize, 15000)
+        XCTAssertEqual(inventory.estimatedFreedBytes(for: .deleteAllAndRuntimes), 19500)
+    }
+
+    func test_malformedRuntimeEntryParsesWithZeroDefaults() throws {
+        let malformedRuntimesJSON = """
+        {
+          "R1" : {
+            "identifier" : "R1",
+            "runtimeIdentifier" : "com.apple.CoreSimulator.SimRuntime.iOS-26-2",
+            "version" : "26.2"
+          }
+        }
+        """.data(using: .utf8)!
+
+        let inventory = try SimulatorInventory.parse(devicesJSON: devicesJSON, runtimesJSON: malformedRuntimesJSON)
+
+        XCTAssertEqual(inventory.runtimes.count, 1)
+        XCTAssertEqual(inventory.runtimes[0].sizeBytes, 0)
+        XCTAssertEqual(inventory.runtimes[0].deletable, false)
+        XCTAssertEqual(inventory.runtimesSize, 0)
+    }
+
+    func test_estimatedFreedBytesForUnavailableDeviceWithoutDataPathSizeDoesNotCrash() throws {
+        let devicesWithMissingSizeJSON = """
+        {
+          "devices" : {
+            "com.apple.CoreSimulator.SimRuntime.iOS-26-5" : [
+              {
+                "udid" : "CCCC",
+                "name" : "iPhone SE",
+                "isAvailable" : false,
+                "state" : "Shutdown"
+              },
+              {
+                "udid" : "DDDD",
+                "name" : "iPhone 15",
+                "isAvailable" : false,
+                "state" : "Shutdown",
+                "dataPathSize" : 500
+              }
+            ]
+          }
+        }
+        """.data(using: .utf8)!
+
+        let inventory = try SimulatorInventory.parse(
+            devicesJSON: devicesWithMissingSizeJSON,
+            runtimesJSON: runtimesJSON
+        )
+
+        XCTAssertEqual(inventory.estimatedFreedBytes(for: .deleteUnavailable), 500)
     }
 }
