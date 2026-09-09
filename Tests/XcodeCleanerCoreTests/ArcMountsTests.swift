@@ -167,12 +167,23 @@ final class ArcMountsTests: XCTestCase {
         XCTAssertTrue(runner.callLines.isEmpty)
     }
 
-    func test_canonicalNormalizesSpelling() {
-        XCTAssertEqual(ArcMountManager.canonical("/Users/tester/arcadia/"), "/users/tester/arcadia")
-        XCTAssertEqual(ArcMountManager.canonical("/Users/tester/./arcadia"), "/users/tester/arcadia")
-        XCTAssertEqual(ArcMountManager.canonical("/Users/Tester/arcadia"), "/users/tester/arcadia")
-        XCTAssertEqual(ArcMountManager.canonical("/"), "/")
-        XCTAssertEqual(ArcMountManager.canonical("//"), "/")
+    func test_comparablePathNormalizesSpellingRelativeToInjectedHome() {
+        let manager = ArcMountManager(runner: FakeCommandRunner(), home: URL(fileURLWithPath: "/Users/tester"))
+
+        XCTAssertEqual(manager.comparablePath("/Users/tester/arcadia/"), "/users/tester/arcadia")
+        XCTAssertEqual(manager.comparablePath("/Users/tester/./arcadia"), "/users/tester/arcadia")
+        XCTAssertEqual(manager.comparablePath("/Users/Tester/arcadia"), "/users/tester/arcadia")
+        XCTAssertEqual(manager.comparablePath("~/arcadia"), "/users/tester/arcadia")
+        XCTAssertEqual(manager.comparablePath("~"), "/users/tester")
+        XCTAssertEqual(manager.comparablePath("/"), "/")
+        XCTAssertEqual(manager.comparablePath("//"), "/")
+    }
+
+    func test_normalizedPathKeepsOriginalCaseAndDropsTrailingSlash() {
+        let manager = ArcMountManager(runner: FakeCommandRunner(), home: URL(fileURLWithPath: "/Users/tester"))
+
+        XCTAssertEqual(manager.normalizedPath("/Users/Tester/arcadia_X/"), "/Users/Tester/arcadia_X")
+        XCTAssertEqual(manager.normalizedPath("~/arcadia_X"), "/Users/tester/arcadia_X")
     }
 
     func test_forgetRefusesMainMountSpelledDifferently() async {
@@ -199,9 +210,8 @@ final class ArcMountsTests: XCTestCase {
     }
 
     func test_forgetRefusesTildeSpelledMainMount() async {
-        let home = FileManager.default.homeDirectoryForCurrentUser
         let runner = FakeCommandRunner()
-        let manager = ArcMountManager(runner: runner, home: home)
+        let manager = ArcMountManager(runner: runner, home: URL(fileURLWithPath: "/Users/tester"))
         let mount = ArcMount(status: .mounted, mount: "~/arcadia", store: "/s", objectStore: "/o")
 
         do {
@@ -429,6 +439,65 @@ final class ArcMountsTests: XCTestCase {
             runner.callLines.last,
             "arc mount -m \(temp.url.appendingPathComponent("arcadia_-rf").path) --object-store /store/.arc/objects --override-object-store"
         )
+    }
+
+    func test_forgetNormalizesTrailingSlashBeforePassingPathToArc() async throws {
+        let runner = FakeCommandRunner()
+        let manager = ArcMountManager(runner: runner, home: URL(fileURLWithPath: "/Users/tester"))
+        let mount = ArcMount(status: .unmounted, mount: "/Users/tester/arcadia_X/", store: "/s", objectStore: "/o")
+
+        try await manager.forget(mount) { _ in }
+
+        XCTAssertEqual(runner.callLines, ["arc unmount --forget /Users/tester/arcadia_X"])
+    }
+
+    func test_unmountRefusesPathsNotInsideHome() async {
+        for path in ["/", "/Users", "/Users/tester", "/Users/other/arcadia_x"] {
+            let runner = FakeCommandRunner()
+            let manager = ArcMountManager(runner: runner, home: URL(fileURLWithPath: "/Users/tester"))
+
+            do {
+                try await manager.unmount(path, force: false) { _ in }
+                XCTFail("expected throw for \(path)")
+            } catch let error as ArcMountError {
+                XCTAssertEqual(error, .refusedPath(path), "path \(path)")
+            } catch {
+                XCTFail("unexpected \(error)")
+            }
+            XCTAssertTrue(runner.callLines.isEmpty, "path \(path)")
+        }
+    }
+
+    func test_mountNewKeepsPreexistingEmptyDirectoryWhenArcMountFails() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let existing = try temp.makeDirectory("arcadia_SAFTIOS-7")
+        let runner = FakeCommandRunner()
+        let mainMount = temp.url.appendingPathComponent("arcadia").path
+        runner.respond(
+            to: "arc mount --list --json",
+            stdout: """
+            [{"status":"mounted","mount":"\(mainMount)","store":"/store","object-store":"/store/.arc/objects"}]
+            """
+        )
+        runner.respond(
+            to: "arc mount -m \(existing.path) --object-store /store/.arc/objects --override-object-store",
+            stderr: "boom",
+            exitCode: 1
+        )
+        let manager = ArcMountManager(runner: runner, home: temp.url)
+        let logged = LineCollector()
+
+        do {
+            _ = try await manager.mountNew(name: "SAFTIOS-7") { logged.append($0) }
+            XCTFail("expected throw")
+        } catch let error as ArcMountError {
+            XCTAssertEqual(error, .commandFailed("arc mount", "boom"))
+        } catch {
+            XCTFail("unexpected \(error)")
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: existing.path))
+        XCTAssertFalse(logged.contains("rmdir"))
     }
 
     func test_mountPathRejectsControlCharacters() {

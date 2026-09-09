@@ -2,20 +2,20 @@ import XCTest
 @testable import XcodeCleanerCore
 
 final class CleanupLogFileTests: XCTestCase {
-    func test_appendsLinesToFileInDirectory() async throws {
+    func test_appendsLinesToFileInDirectory() throws {
         let temp = try TemporaryDirectory()
         defer { temp.remove() }
         let log = try CleanupLogFile(directory: temp.url, runID: "test-run")
 
-        await log.append("first")
-        await log.append("second")
+        log.append("first")
+        log.append("second")
 
         let contents = try String(contentsOf: log.fileURL, encoding: .utf8)
         XCTAssertEqual(contents, "first\nsecond\n")
         XCTAssertEqual(log.fileURL.lastPathComponent, "cleanup-test-run.log")
     }
 
-    func test_appendLineKeepsOrderOfSynchronousCalls() async throws {
+    func test_appendLineKeepsOrderOfSynchronousCalls() throws {
         let temp = try TemporaryDirectory()
         defer { temp.remove() }
         let log = try CleanupLogFile(directory: temp.url, runID: "ordering")
@@ -24,20 +24,20 @@ final class CleanupLogFileTests: XCTestCase {
         for line in expected {
             log.appendLine(line)
         }
-        await log.close()
+        log.close()
 
         let contents = try String(contentsOf: log.fileURL, encoding: .utf8)
         XCTAssertEqual(contents.split(separator: "\n", omittingEmptySubsequences: false).dropLast().map(String.init), expected)
     }
 
-    func test_closeIsIdempotent() async throws {
+    func test_closeIsIdempotent() throws {
         let temp = try TemporaryDirectory()
         defer { temp.remove() }
         let log = try CleanupLogFile(directory: temp.url, runID: "close-twice")
 
         log.appendLine("only")
-        await log.close()
-        await log.close()
+        log.close()
+        log.close()
 
         let contents = try String(contentsOf: log.fileURL, encoding: .utf8)
         XCTAssertEqual(contents, "only\n")

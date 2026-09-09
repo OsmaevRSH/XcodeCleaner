@@ -1,27 +1,25 @@
 import Foundation
 
-public actor CleanupLogFile {
-    public nonisolated let fileURL: URL
+/// Writes the cleanup log straight to disk under a lock: the callers are synchronous `Sendable`
+/// closures invoked from background threads, and buffering their lines through an actor or a
+/// stream would either reorder them or lose the tail when the app exits mid-run.
+///
+/// `@unchecked Sendable` because `FileHandle` is not `Sendable` and `isClosed` is mutable; both are
+/// only ever touched inside `lock`.
+public final class CleanupLogFile: @unchecked Sendable {
+    public let fileURL: URL
+    private let lock = NSLock()
     private let handle: FileHandle
-    private nonisolated let continuation: AsyncStream<String>.Continuation
-    private nonisolated(unsafe) var drainTask: Task<Void, Never>?
+    private var isClosed = false
 
     public init(directory: URL, runID: String = CleanupLogFile.defaultRunID()) throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         fileURL = directory.appendingPathComponent("cleanup-\(runID).log")
         FileManager.default.createFile(atPath: fileURL.path, contents: nil)
-        let handle = try FileHandle(forWritingTo: fileURL)
+        handle = try FileHandle(forWritingTo: fileURL)
         // The file is only ever appended to by this instance, so the offset is placed once here
         // instead of on every line.
         _ = try? handle.seekToEnd()
-        self.handle = handle
-        let (stream, continuation) = AsyncStream<String>.makeStream(of: String.self)
-        self.continuation = continuation
-        drainTask = Task { [weak self] in
-            for await line in stream {
-                await self?.append(line)
-            }
-        }
     }
 
     public static func defaultRunID(now: Date = Date()) -> String {
@@ -37,25 +35,26 @@ public actor CleanupLogFile {
 
     /// The non-throwing `FileHandle` writing API raises an Objective-C exception that no Swift
     /// `catch` can intercept, so a full disk would take the whole app down mid-cleanup.
+    public func appendLine(_ line: String) {
+        lock.withLock {
+            guard isClosed == false else { return }
+            try? handle.write(contentsOf: Data((line + "\n").utf8))
+        }
+    }
+
     public func append(_ line: String) {
-        try? handle.write(contentsOf: Data((line + "\n").utf8))
+        appendLine(line)
     }
 
-    /// Entry point for synchronous loggers: buffering through the stream keeps the lines in call
-    /// order, which independently spawned `Task`s would not.
-    public nonisolated func appendLine(_ line: String) {
-        continuation.yield(line)
-    }
-
-    public func close() async {
-        continuation.finish()
-        await drainTask?.value
-        drainTask = nil
-        try? handle.close()
+    public func close() {
+        lock.withLock {
+            guard isClosed == false else { return }
+            isClosed = true
+            try? handle.close()
+        }
     }
 
     deinit {
-        continuation.finish()
-        try? handle.close()
+        close()
     }
 }

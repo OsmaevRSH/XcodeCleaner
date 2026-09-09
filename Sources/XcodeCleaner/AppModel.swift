@@ -76,6 +76,7 @@ final class AppModel {
     private let scanner: XcodeCleanerCore.Scanner
     private let mountManager: ArcMountManager
     private var logFile: CleanupLogFile?
+    private var hasPreselected = false
 
     init(runner: any CommandRunning = ProcessCommandRunner(), cachePaths: CachePaths = CachePaths()) {
         self.runner = runner
@@ -151,6 +152,13 @@ final class AppModel {
         let validIDs = Set(items.map(\.id))
         selectedItemIDs.formIntersection(validIDs)
         selectedMountIDs.formIntersection(Set(scan.mounts.map(\.id)))
+        // The first scan of a session arrives at an empty selection, so it starts the user on the
+        // safe default — caches, unavailable simulators, the dyld cache — instead of nothing at
+        // all. Later scans respect whatever the user picked.
+        if hasPreselected == false {
+            hasPreselected = true
+            selectedItemIDs.formUnion(items.filter { $0.isDestructive == false }.map(\.id))
+        }
         for warning in scan.warnings {
             log("⚠︎ \(warning)")
         }
