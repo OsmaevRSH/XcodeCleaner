@@ -40,6 +40,13 @@ public struct ArcMountInfo: Sendable, Equatable, Identifiable, Hashable {
     public let isMain: Bool
     public let sharesMainObjectStore: Bool
 
+    public init(mount: ArcMount, storeSizeBytes: Int64?, isMain: Bool, sharesMainObjectStore: Bool) {
+        self.mount = mount
+        self.storeSizeBytes = storeSizeBytes
+        self.isMain = isMain
+        self.sharesMainObjectStore = sharesMainObjectStore
+    }
+
     public var id: String { mount.id }
 }
 
@@ -48,7 +55,14 @@ public enum ArcMountError: Error, Equatable, Sendable {
     case directoryNotEmpty(String)
     case mainMountNotFound
     case mainMountProtected
+    case refusedPath(String)
     case commandFailed(String, String)
+}
+
+/// `FileManager` is not `Sendable`, but only the shared instance — documented as thread-safe —
+/// is ever handed to the sizing tasks, so it crosses task boundaries in an explicit box.
+private struct UncheckedFileManager: @unchecked Sendable {
+    let value: FileManager
 }
 
 public struct ArcMountManager: Sendable {
@@ -56,6 +70,8 @@ public struct ArcMountManager: Sendable {
 
     private let runner: any CommandRunning
     private let home: URL
+    // Only `FileManager.default` is ever injected here, and Apple documents the shared instance as
+    // thread-safe. A caller-supplied `FileManager` carrying a delegate would not be.
     private nonisolated(unsafe) let fileManager: FileManager
 
     public init(runner: any CommandRunning, home: URL, fileManager: FileManager = .default) {
@@ -66,29 +82,89 @@ public struct ArcMountManager: Sendable {
 
     public var mainMountPath: String { home.appendingPathComponent("arcadia").path }
 
-    public func list() async throws -> [ArcMountInfo] {
+    /// Compares mount paths the way the guards need to: `arc` may report the main mount with a
+    /// trailing slash, a `.` component, a `~` or different case, and every one of those spellings
+    /// must still be recognised as the main mount. Deliberately pure string/URL work — resolving
+    /// symlinks would touch the filesystem, and a stale FUSE mount path can hang for minutes.
+    public static func canonical(_ path: String) -> String {
+        var expanded = (path as NSString).expandingTildeInPath
+        while expanded.count > 1, expanded.hasSuffix("/") {
+            expanded.removeLast()
+        }
+        return URL(fileURLWithPath: expanded).standardizedFileURL.path.lowercased()
+    }
+
+    public func mounts() async throws -> [ArcMount] {
         let result = try await runner.run("arc", ["mount", "--list", "--json"], currentDirectory: home, onOutputLine: nil)
         guard result.succeeded else {
             throw ArcMountError.commandFailed("arc mount --list", result.stderr)
         }
-        let mounts = try ArcMount.parse(Data(result.stdout.utf8))
-        let main = mounts.first { $0.mount == mainMountPath }
-        return mounts
-            .sorted { $0.mount < $1.mount }
-            .map { mount in
-                let isMain = mount.mount == mainMountPath
-                return ArcMountInfo(
-                    mount: mount,
-                    storeSizeBytes: isMain ? nil : DirectorySizer.size(of: URL(fileURLWithPath: mount.store), fileManager: fileManager),
-                    isMain: isMain,
-                    sharesMainObjectStore: main.map { $0.objectStore == mount.objectStore } ?? false
-                )
+        let parsed: [ArcMount]
+        do {
+            parsed = try ArcMount.parse(Data(result.stdout.utf8))
+        } catch let error as DecodingError {
+            throw ArcMountError.commandFailed("arc mount --list", "\(error)")
+        }
+        let main = Self.canonical(mainMountPath)
+        return parsed.sorted { lhs, rhs in
+            let lhsIsMain = Self.canonical(lhs.mount) == main
+            let rhsIsMain = Self.canonical(rhs.mount) == main
+            if lhsIsMain != rhsIsMain {
+                return lhsIsMain
             }
+            return lhs.mount.localizedStandardCompare(rhs.mount) == .orderedAscending
+        }
     }
 
+    /// Sizing the per-mount stores walks tens of gigabytes, so it runs off the cooperative pool and
+    /// only for the mounts that can actually be forgotten. The main mount is skipped entirely.
+    public func storeSizes(for mounts: [ArcMount]) async -> [String: Int64] {
+        let main = Self.canonical(mainMountPath)
+        let sizing = UncheckedFileManager(value: fileManager)
+        return await withTaskGroup(of: (String, Int64).self) { group in
+            for mount in mounts where Self.canonical(mount.mount) != main {
+                let key = mount.mount
+                let store = mount.store
+                group.addTask {
+                    let size = await Task.detached(priority: .utility) {
+                        DirectorySizer.size(of: URL(fileURLWithPath: store), fileManager: sizing.value)
+                    }.value
+                    return (key, size)
+                }
+            }
+            var sizes: [String: Int64] = [:]
+            for await (key, size) in group {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
+                sizes[key] = size
+            }
+            return sizes
+        }
+    }
+
+    public func list() async throws -> [ArcMountInfo] {
+        let mounts = try await mounts()
+        let sizes = await storeSizes(for: mounts)
+        let mainPath = Self.canonical(mainMountPath)
+        let main = mounts.first { Self.canonical($0.mount) == mainPath }
+        return mounts.map { mount in
+            let isMain = Self.canonical(mount.mount) == mainPath
+            return ArcMountInfo(
+                mount: mount,
+                storeSizeBytes: isMain ? nil : sizes[mount.mount],
+                isMain: isMain,
+                sharesMainObjectStore: main.map { $0.objectStore == mount.objectStore } ?? false
+            )
+        }
+    }
+
+    /// The name is only ever a path *suffix* after the fixed `arcadia_` prefix, so a name starting
+    /// with `-` can never turn into an option when the path is passed to `arc mount -m`.
     public func mountPath(forName name: String) throws -> URL {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let forbidden = CharacterSet(charactersIn: "/ \t\n")
+        let forbidden = CharacterSet(charactersIn: "/ \t\n").union(.controlCharacters)
         guard trimmed.isEmpty == false,
               trimmed != "..",
               trimmed.rangeOfCharacter(from: forbidden) == nil
@@ -107,16 +183,18 @@ public struct ArcMountManager: Sendable {
                 throw ArcMountError.directoryNotEmpty(path.path)
             }
         }
-        let infos = try await list()
-        guard let main = infos.first(where: \.isMain) else {
+        let mounts = try await mounts()
+        let mainPath = Self.canonical(mainMountPath)
+        guard let main = mounts.first(where: { Self.canonical($0.mount) == mainPath }) else {
             throw ArcMountError.mainMountNotFound
         }
         try fileManager.createDirectory(at: path, withIntermediateDirectories: true)
         log("mkdir -p \(path.path)")
-        let arguments = ["mount", "-m", path.path, "--object-store", main.mount.objectStore, "--override-object-store"]
+        let arguments = ["mount", "-m", path.path, "--object-store", main.objectStore, "--override-object-store"]
         log("arc \(arguments.joined(separator: " "))")
         let result = try await runner.run("arc", arguments, currentDirectory: home, onOutputLine: log)
         guard result.succeeded else {
+            removeEmptyMountDirectory(path.path, log: log)
             throw ArcMountError.commandFailed("arc mount", result.stderr)
         }
         return path
@@ -134,9 +212,10 @@ public struct ArcMountManager: Sendable {
     }
 
     public func forget(_ mount: ArcMount, log: @escaping Log) async throws {
-        guard mount.mount != mainMountPath else {
+        guard Self.canonical(mount.mount) != Self.canonical(mainMountPath) else {
             throw ArcMountError.mainMountProtected
         }
+        try refuseUnsafePath(mount.mount)
         if mount.isMounted {
             try await unmount(mount.mount, force: false, log: log)
         }
@@ -149,18 +228,35 @@ public struct ArcMountManager: Sendable {
         removeEmptyMountDirectory(mount.mount, log: log)
     }
 
+    /// `--forget` deletes the mount's store, so a malformed `arc` answer such as `/` or `/Users`
+    /// must never reach it: only paths strictly below the home directory are accepted.
+    private func refuseUnsafePath(_ path: String) throws {
+        let homeComponents = URL(fileURLWithPath: Self.canonical(home.path)).pathComponents
+        let pathComponents = URL(fileURLWithPath: Self.canonical(path)).pathComponents
+        guard pathComponents.count > homeComponents.count,
+              Array(pathComponents.prefix(homeComponents.count)) == homeComponents
+        else {
+            throw ArcMountError.refusedPath(path)
+        }
+    }
+
+    /// `rmdir(2)` removes the directory only when it is empty, so there is no window between
+    /// checking and deleting in which the mount could be repopulated (or replaced by a symlink)
+    /// and then removed recursively.
     private func removeEmptyMountDirectory(_ path: String, log: Log) {
-        guard fileManager.fileExists(atPath: path) else { return }
-        let contents = (try? fileManager.contentsOfDirectory(atPath: path)) ?? ["?"]
-        guard contents.isEmpty else {
-            log("Папка \(path) не пуста, оставлена на месте")
+        guard rmdir(path) != 0 else {
+            log("rmdir \(path)")
             return
         }
-        do {
-            try fileManager.removeItem(atPath: path)
-            log("rmdir \(path)")
-        } catch {
-            log("Не удалось удалить пустую папку \(path): \(error.localizedDescription)")
+        let code = errno
+        switch code {
+        case ENOTEMPTY, EEXIST:
+            log("Папка \(path) не пуста, оставлена на месте")
+        case ENOENT:
+            return
+        default:
+            let message = strerror(code).map { String(cString: $0) } ?? "errno \(code)"
+            log("Не удалось удалить папку \(path): \(message)")
         }
     }
 }
