@@ -60,8 +60,13 @@ final class CleanerTests: XCTestCase {
         XCTAssertEqual(report.failureCount, 1)
         XCTAssertNotNil(report.diskBefore)
         XCTAssertNotNil(report.diskAfter)
+        let trashedPath = try XCTUnwrap(
+            report.results.first { $0.itemID == "archive" }?.message?.components(separatedBy: ": ").last
+        )
+        defer { try? FileManager.default.removeItem(atPath: trashedPath) }
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: cache.path), [])
         XCTAssertFalse(FileManager.default.fileExists(atPath: archive.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: trashedPath))
         XCTAssertTrue(FileManager.default.fileExists(atPath: notAllowed.path))
         let simctlCalls = runner.callLines.filter { $0.hasPrefix("xcrun simctl") }
         XCTAssertEqual(simctlCalls, [
@@ -167,10 +172,50 @@ final class CleanerTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: junk.path))
     }
 
+    func test_trashOfDisallowedParentIsRecordedAsFailureAndRunContinues() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let cache = try temp.makeDirectory("DerivedData")
+        try temp.makeFile("DerivedData/junk", bytes: 10)
+        let stray = try temp.makeFile("Elsewhere/Stray.xcarchive", bytes: 10)
+        let runner = idleRunner()
+        let deleter = SafeDeleter(clearableDirectories: [cache], trashableParents: [])
+        let cleaner = Cleaner(runner: runner, deleter: deleter, home: temp.url)
+        let items = [
+            CleanupItem(id: "stray", kind: .archives, title: "", subtitle: "", action: .trash(stray), sizeBytes: nil, isDestructive: true),
+            CleanupItem(id: "cache", kind: .projectCaches, title: "", subtitle: "", action: .clearContents(cache), sizeBytes: nil, isDestructive: false),
+        ]
+
+        let report = try await cleaner.run(items) { _ in }
+
+        XCTAssertEqual(report.results.map(\.itemID), ["stray", "cache"])
+        XCTAssertEqual(report.results.map(\.succeeded), [false, true])
+        XCTAssertEqual(
+            report.results[0].message,
+            SafeDeleterError.notAllowed(stray.path).localizedDescription
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stray.path))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: cache.path), [])
+    }
+
     func test_makeDeleterAllowsArchiveDayFoldersAndMountedProjectCaches() {
         let paths = CachePaths(home: URL(fileURLWithPath: "/Users/tester"))
         let scanner = Scanner(runner: FakeCommandRunner(), cachePaths: paths)
         var result = ScanResult()
+        result.xcodes = [
+            XcodeInstallation(
+                url: paths.applicationsDirectory.appendingPathComponent("Xcode-16.0.app"),
+                isActive: false,
+                sizeBytes: 1
+            ),
+        ]
+        result.toolchains = [
+            ToolchainEntry(
+                url: paths.toolchainsDirectory.appendingPathComponent("swift-6.0.xctoolchain"),
+                isProtected: false,
+                sizeBytes: 1
+            ),
+        ]
         result.archives = [
             ArchiveEntry(
                 url: paths.archivesDirectory.appendingPathComponent("2026-09-09/App.xcarchive"),
@@ -210,7 +255,7 @@ final class CleanerTests: XCTestCase {
 
         let deleter = scanner.makeDeleter(for: result)
 
-        XCTAssertTrue(deleter.trashableParents.contains("/Applications"))
+        XCTAssertTrue(deleter.trashableParents.contains(paths.applicationsDirectory.path))
         XCTAssertTrue(deleter.trashableParents.contains(paths.toolchainsDirectory.path))
         XCTAssertTrue(deleter.trashableParents.contains(paths.archivesDirectory.appendingPathComponent("2026-09-09").path))
         XCTAssertTrue(deleter.trashableParents.contains(paths.archivesDirectory.appendingPathComponent("2026-09-08").path))
@@ -224,19 +269,35 @@ final class CleanerTests: XCTestCase {
         XCTAssertTrue(deleter.clearableDirectories.contains(paths.xcodeCaches[0].path))
     }
 
+    func test_makeDeleterTrashesNothingWhenScanFoundNoTrashableEntries() {
+        let paths = CachePaths(home: URL(fileURLWithPath: "/Users/tester"))
+        let scanner = Scanner(runner: FakeCommandRunner(), cachePaths: paths)
+
+        let deleter = scanner.makeDeleter(for: ScanResult())
+
+        XCTAssertFalse(deleter.trashableParents.contains(paths.applicationsDirectory.path))
+        XCTAssertFalse(deleter.trashableParents.contains(paths.toolchainsDirectory.path))
+        XCTAssertTrue(deleter.trashableParents.isEmpty)
+    }
+
     func test_scanBuildsResultFromExistingCachesOnly() async throws {
         let temp = try TemporaryDirectory()
         defer { temp.remove() }
         try temp.makeDirectory("Library/Developer/Xcode/DerivedData")
+        let applications = try temp.makeDirectory("Applications")
+        let developer = try temp.makeDirectory("Applications/Xcode-1.0.app/Contents/Developer")
         let runner = FakeCommandRunner()
         runner.respond(to: "xcrun simctl list devices -j", stdout: #"{"devices":{}}"#)
         runner.respond(to: "xcrun simctl runtime list -j", stdout: "{}")
-        runner.respond(to: "xcode-select -p", stdout: "/Applications/Xcode.app/Contents/Developer\n")
+        runner.respond(to: "xcode-select -p", stdout: "\(developer.path)\n")
         runner.respond(to: "arc mount --list --json", stdout: "[]")
-        let scanner = Scanner(runner: runner, cachePaths: CachePaths(home: temp.url))
+        let paths = CachePaths(home: temp.url, applicationsDirectory: applications)
+        let scanner = Scanner(runner: runner, cachePaths: paths)
 
         let result = await scanner.scan()
 
+        XCTAssertEqual(result.xcodes.map(\.name), ["Xcode-1.0.app"])
+        XCTAssertEqual(result.xcodes.map(\.isActive), [true])
         XCTAssertEqual(result.cacheItems.count, 1)
         XCTAssertEqual(result.cacheItems.first?.title, "DerivedData")
         XCTAssertEqual(result.cacheItems.first?.kind, .xcodeCaches)

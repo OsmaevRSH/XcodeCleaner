@@ -137,8 +137,8 @@ public struct Cleaner: Sendable {
             }
         case let .trash(url):
             do {
-                try deleter.trash(url, fileManager: fileManager)
-                return ItemResult(itemID: item.id, succeeded: true, message: "в Корзину")
+                let resultingURL = try deleter.trash(url, fileManager: fileManager)
+                return ItemResult(itemID: item.id, succeeded: true, message: "в Корзину: \(resultingURL.path)")
             } catch {
                 return ItemResult(itemID: item.id, succeeded: false, message: error.localizedDescription)
             }

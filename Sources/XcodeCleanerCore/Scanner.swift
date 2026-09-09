@@ -70,14 +70,19 @@ public struct Scanner: Sendable {
         return result
     }
 
-    /// Archives live at `Archives/<day>/<name>.xcarchive`, so it is the *day folder* — not the
-    /// archives root — that has to be trashable for `SafeDeleter` to accept an archive.
+    /// Trashing is only offered for entries the scan actually found, so the allowlist of parents
+    /// is derived from those entries rather than from fixed directories: an archive lives in an
+    /// `Archives/<day>` folder, never in the archives root, and nothing in `/Applications` becomes
+    /// trashable until an Xcode was found there.
     public func makeDeleter(for result: ScanResult) -> SafeDeleter {
-        SafeDeleter(
+        let trashableParents = Set(
+            (result.xcodes.map(\.url) + result.toolchains.map(\.url) + result.archives.map(\.url))
+                .map { $0.deletingLastPathComponent() }
+        )
+        return SafeDeleter(
             clearableDirectories: cachePaths.allClearable
                 + ProjectCacheScanner.allowedDirectories(mounts: result.mounts, cachePaths: cachePaths),
-            trashableParents: [cachePaths.applicationsDirectory, cachePaths.toolchainsDirectory]
-                + Array(Set(result.archives.map { $0.url.deletingLastPathComponent() }))
+            trashableParents: Array(trashableParents)
         )
     }
 

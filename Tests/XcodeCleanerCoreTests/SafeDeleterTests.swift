@@ -82,9 +82,29 @@ final class SafeDeleterTests: XCTestCase {
         let item = try temp.makeFile("Archives/old.xcarchive", bytes: 10)
         let deleter = SafeDeleter(clearableDirectories: [], trashableParents: [parent])
 
-        try deleter.trash(item)
+        let resulting = try deleter.trash(item)
+        defer { try? FileManager.default.removeItem(at: resulting) }
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: item.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: resulting.path))
+        XCTAssertNotEqual(resulting.standardizedFileURL, item.standardizedFileURL)
+    }
+
+    func test_trashMovesWholeDirectoryBundle() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let parent = try temp.makeDirectory("Archives")
+        let bundle = try temp.makeDirectory("Archives/Old.xcarchive")
+        try temp.makeFile("Archives/Old.xcarchive/Products/app.bin", bytes: 10)
+        let deleter = SafeDeleter(clearableDirectories: [], trashableParents: [parent])
+
+        let resulting = try deleter.trash(bundle)
+        defer { try? FileManager.default.removeItem(at: resulting) }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: bundle.path))
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: resulting.appendingPathComponent("Products/app.bin").path)
+        )
     }
 
     func test_clearContentsRefusesDirectoryBehindSymlinkedAncestor() throws {
@@ -219,7 +239,8 @@ final class SafeDeleterTests: XCTestCase {
         let item = try temp.makeFile("Archives/Old.XCARCHIVE", bytes: 10)
         let deleter = SafeDeleter(clearableDirectories: [], trashableParents: [parent])
 
-        try deleter.trash(item)
+        let resulting = try deleter.trash(item)
+        defer { try? FileManager.default.removeItem(at: resulting) }
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: item.path))
     }

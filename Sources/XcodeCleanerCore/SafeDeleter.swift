@@ -77,7 +77,10 @@ public struct SafeDeleter: Sendable {
         return failures
     }
 
-    public func trash(_ url: URL, fileManager: FileManager = .default) throws {
+    /// Returns where the item ended up in the trash: Finder renames collisions, so the caller
+    /// cannot reconstruct the path and would otherwise have nothing to report or clean up.
+    @discardableResult
+    public func trash(_ url: URL, fileManager: FileManager = .default) throws -> URL {
         let target = url.standardizedFileURL
         let parent = target.deletingLastPathComponent()
         guard trashableParents.contains(parent.path),
@@ -93,7 +96,9 @@ public struct SafeDeleter: Sendable {
         guard attributes.type != .typeSymbolicLink else {
             throw SafeDeleterError.isSymlink(url.path)
         }
-        try fileManager.trashItem(at: target, resultingItemURL: nil)
+        var resultingURL: NSURL?
+        try fileManager.trashItem(at: target, resultingItemURL: &resultingURL)
+        return resultingURL as URL? ?? target
     }
 
     /// `lstat` only refuses to follow the *last* path component, so an allowlisted path whose

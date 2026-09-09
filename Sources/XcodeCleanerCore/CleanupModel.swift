@@ -87,9 +87,14 @@ public struct CleanupItem: Identifiable, Hashable, Sendable {
 
 public struct CachePaths: Sendable {
     public let home: URL
+    public let applicationsDirectory: URL
 
-    public init(home: URL = FileManager.default.homeDirectoryForCurrentUser) {
+    public init(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        applicationsDirectory: URL = URL(fileURLWithPath: "/Applications")
+    ) {
         self.home = home.standardizedFileURL
+        self.applicationsDirectory = applicationsDirectory.standardizedFileURL
     }
 
     public static let projectCacheSubpaths = [
@@ -132,7 +137,6 @@ public struct CachePaths: Sendable {
 
     public var archivesDirectory: URL { library("Developer/Xcode/Archives") }
     public var toolchainsDirectory: URL { library("Developer/Toolchains") }
-    public var applicationsDirectory: URL { URL(fileURLWithPath: "/Applications") }
     public var arcStoresDirectory: URL { home.appendingPathComponent(".arc/stores") }
     public var mainArcadiaMount: URL { home.appendingPathComponent("arcadia") }
 
