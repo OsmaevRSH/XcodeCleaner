@@ -10,14 +10,29 @@ public struct DeletionFailure: Sendable, Equatable {
     }
 }
 
-public enum SafeDeleterError: Error, Equatable, Sendable {
+public enum SafeDeleterError: Error, Equatable, Sendable, LocalizedError {
     case notAllowed(String)
     case notADirectory(String)
     case isSymlink(String)
-    case cannotInspect(String)
+    case cannotInspect(String, String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .notAllowed(let path):
+            "Путь не входит в allowlist: \(path)"
+        case .notADirectory(let path):
+            "Путь не является директорией: \(path)"
+        case .isSymlink(let path):
+            "Путь является символической ссылкой или ведёт через неё: \(path)"
+        case .cannotInspect(let path, let reason):
+            "Не удалось прочитать атрибуты пути \(path): \(reason)"
+        }
+    }
 }
 
 public struct SafeDeleter: Sendable {
+    public static let trashableExtensions: Set<String> = ["xcarchive", "app", "xctoolchain"]
+
     public let clearableDirectories: Set<String>
     public let trashableParents: Set<String>
 
@@ -30,11 +45,12 @@ public struct SafeDeleter: Sendable {
         of directory: URL,
         fileManager: FileManager = .default
     ) throws -> [DeletionFailure] {
-        let path = Self.normalize(directory)
-        guard clearableDirectories.contains(path) else {
+        let target = directory.standardizedFileURL
+        guard clearableDirectories.contains(target.path) else {
             throw SafeDeleterError.notAllowed(directory.path)
         }
-        let attributes = try Self.attributes(atPath: directory.path, fileManager: fileManager)
+        try Self.rejectSymlinkTraversal(directory)
+        let attributes = try Self.attributes(atPath: target.path, fileManager: fileManager)
         if attributes.type == .typeSymbolicLink {
             throw SafeDeleterError.isSymlink(directory.path)
         }
@@ -43,9 +59,9 @@ public struct SafeDeleter: Sendable {
         }
 
         var failures: [DeletionFailure] = []
-        let children = try fileManager.contentsOfDirectory(atPath: directory.path)
+        let children = try fileManager.contentsOfDirectory(atPath: target.path)
         for name in children {
-            let child = directory.appendingPathComponent(name)
+            let child = target.appendingPathComponent(name)
             do {
                 let childAttributes = try Self.attributes(atPath: child.path, fileManager: fileManager)
                 if childAttributes.type != .typeSymbolicLink,
@@ -62,11 +78,22 @@ public struct SafeDeleter: Sendable {
     }
 
     public func trash(_ url: URL, fileManager: FileManager = .default) throws {
-        let parent = Self.normalize(url.deletingLastPathComponent())
-        guard trashableParents.contains(parent) else {
+        let target = url.standardizedFileURL
+        guard trashableParents.contains(target.deletingLastPathComponent().path),
+              Self.trashableExtensions.contains(target.pathExtension)
+        else {
             throw SafeDeleterError.notAllowed(url.path)
         }
-        try fileManager.trashItem(at: url, resultingItemURL: nil)
+        try Self.rejectSymlinkTraversal(url)
+        try fileManager.trashItem(at: target, resultingItemURL: nil)
+    }
+
+    /// `lstat` only refuses to follow the *last* path component, so an allowlisted path whose
+    /// ancestor is a symlink would still resolve to — and wipe — somewhere else entirely.
+    private static func rejectSymlinkTraversal(_ url: URL) throws {
+        guard url.resolvingSymlinksInPath().path == url.standardizedFileURL.path else {
+            throw SafeDeleterError.isSymlink(url.path)
+        }
     }
 
     private struct ItemAttributes {
@@ -79,10 +106,12 @@ public struct SafeDeleter: Sendable {
         do {
             raw = try fileManager.attributesOfItem(atPath: path)
         } catch {
-            throw SafeDeleterError.cannotInspect(path)
+            throw SafeDeleterError.cannotInspect(path, error.localizedDescription)
         }
         let type = (raw[.type] as? FileAttributeType) ?? .typeUnknown
-        let device = (raw[.systemNumber] as? Int) ?? -1
+        guard let device = raw[.systemNumber] as? Int else {
+            throw SafeDeleterError.cannotInspect(path, "атрибут systemNumber недоступен")
+        }
         return ItemAttributes(type: type, device: device)
     }
 

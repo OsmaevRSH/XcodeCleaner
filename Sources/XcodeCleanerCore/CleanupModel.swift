@@ -154,7 +154,8 @@ public enum CacheItemBuilder {
         directories.compactMap { directory in
             var isDirectory: ObjCBool = false
             guard fileManager.fileExists(atPath: directory.path, isDirectory: &isDirectory),
-                  isDirectory.boolValue
+                  isDirectory.boolValue,
+                  directory.resolvingSymlinksInPath().path == directory.standardizedFileURL.path
             else {
                 return nil
             }

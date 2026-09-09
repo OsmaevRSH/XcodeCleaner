@@ -86,4 +86,93 @@ final class SafeDeleterTests: XCTestCase {
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: item.path))
     }
+
+    func test_clearContentsRefusesDirectoryBehindSymlinkedAncestor() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let real = try temp.makeDirectory("real/DerivedData")
+        try temp.makeFile("real/DerivedData/keep.bin", bytes: 10)
+        _ = try temp.makeSymlink("linkdir", to: temp.url.appendingPathComponent("real"))
+        let throughLink = temp.url.appendingPathComponent("linkdir/DerivedData")
+        let deleter = SafeDeleter(clearableDirectories: [throughLink], trashableParents: [])
+
+        XCTAssertThrowsError(try deleter.clearContents(of: throughLink)) { error in
+            XCTAssertEqual(error as? SafeDeleterError, .isSymlink(throughLink.path))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: real.appendingPathComponent("keep.bin").path))
+    }
+
+    func test_clearContentsAcceptsUnnormalizedPathForAllowedDirectory() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let cache = try temp.makeDirectory("DerivedData")
+        try temp.makeFile("DerivedData/a.bin", bytes: 10)
+        let unnormalized = temp.url.appendingPathComponent("other/../DerivedData")
+        let deleter = SafeDeleter(clearableDirectories: [cache], trashableParents: [])
+
+        let failures = try deleter.clearContents(of: unnormalized)
+
+        XCTAssertTrue(failures.isEmpty)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: cache.path), [])
+    }
+
+    func test_trashRefusesDisallowedExtension() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let parent = try temp.makeDirectory("Archives")
+        let stray = try temp.makeFile("Archives/stray.bin", bytes: 10)
+        let deleter = SafeDeleter(clearableDirectories: [], trashableParents: [parent])
+
+        XCTAssertThrowsError(try deleter.trash(stray)) { error in
+            XCTAssertEqual(error as? SafeDeleterError, .notAllowed(stray.path))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stray.path))
+    }
+
+    func test_trashRefusesItemBehindSymlinkedAncestor() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        try temp.makeDirectory("real/Archives")
+        let item = try temp.makeFile("real/Archives/old.xcarchive", bytes: 10)
+        _ = try temp.makeSymlink("linkdir", to: temp.url.appendingPathComponent("real"))
+        let parentThroughLink = temp.url.appendingPathComponent("linkdir/Archives")
+        let itemThroughLink = parentThroughLink.appendingPathComponent("old.xcarchive")
+        let deleter = SafeDeleter(clearableDirectories: [], trashableParents: [parentThroughLink])
+
+        XCTAssertThrowsError(try deleter.trash(itemThroughLink)) { error in
+            XCTAssertEqual(error as? SafeDeleterError, .isSymlink(itemThroughLink.path))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: item.path))
+    }
+
+    func test_errorsHaveReadableDescriptions() {
+        let errors: [SafeDeleterError] = [
+            .notAllowed("/a"),
+            .notADirectory("/b"),
+            .isSymlink("/c"),
+            .cannotInspect("/d", "boom"),
+        ]
+        for error in errors {
+            XCTAssertEqual(error.localizedDescription, error.errorDescription)
+            XCTAssertFalse(error.localizedDescription.isEmpty)
+        }
+        XCTAssertTrue(SafeDeleterError.notAllowed("/a").localizedDescription.contains("/a"))
+        XCTAssertTrue(SafeDeleterError.cannotInspect("/d", "boom").localizedDescription.contains("boom"))
+    }
+
+    func test_cannotInspectCarriesUnderlyingReason() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let cache = try temp.makeDirectory("DerivedData")
+        let deleter = SafeDeleter(clearableDirectories: [cache], trashableParents: [])
+        try FileManager.default.removeItem(at: cache)
+
+        XCTAssertThrowsError(try deleter.clearContents(of: cache)) { error in
+            guard case .cannotInspect(let path, let reason)? = error as? SafeDeleterError else {
+                return XCTFail("unexpected \(error)")
+            }
+            XCTAssertEqual(path, cache.path)
+            XCTAssertFalse(reason.isEmpty)
+        }
+    }
 }
