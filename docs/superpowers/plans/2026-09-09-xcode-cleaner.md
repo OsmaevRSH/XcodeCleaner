@@ -2561,7 +2561,7 @@ public struct ScanResult: Sendable, Equatable {
 public struct Scanner: Sendable {
     private let runner: any CommandRunning
     private let cachePaths: CachePaths
-    private let fileManager: FileManager
+    private nonisolated(unsafe) let fileManager: FileManager
 
     public init(runner: any CommandRunning, cachePaths: CachePaths, fileManager: FileManager = .default) {
         self.runner = runner
@@ -2590,7 +2590,9 @@ public struct Scanner: Sendable {
         let (mountInfos, mountWarning) = await mounts
         result.mounts = mountInfos
         result.projectCacheItems = ProjectCacheScanner.items(mounts: mountInfos, cachePaths: cachePaths, fileManager: fileManager)
-        result.warnings = [simulatorWarning, xcodeWarning, mountWarning].compactMap { $0 }
+        let symlinked = CacheItemBuilder.symlinkedDirectories(cachePaths.allClearable, fileManager: fileManager)
+        let symlinkWarnings = symlinked.map { "Пропущено, путь проходит через симлинк: \($0.path)" }
+        result.warnings = [simulatorWarning, xcodeWarning, mountWarning].compactMap { $0 } + symlinkWarnings
         return result
     }
 
@@ -2679,7 +2681,7 @@ public struct Cleaner: Sendable {
 
     private let runner: any CommandRunning
     private let deleter: SafeDeleter
-    private let fileManager: FileManager
+    private nonisolated(unsafe) let fileManager: FileManager
     private let home: URL
 
     public init(runner: any CommandRunning, deleter: SafeDeleter, fileManager: FileManager = .default, home: URL) {
@@ -2695,7 +2697,7 @@ public struct Cleaner: Sendable {
     }
 
     public func run(_ items: [CleanupItem], log: @escaping Log) async throws -> CleanupReport {
-        let blocking = await RunningAppsCheck(runner: runner).blockingProcesses()
+        let blocking = try await RunningAppsCheck(runner: runner).blockingProcesses()
         guard blocking.isEmpty else {
             throw CleanerError.blockingProcesses(blocking)
         }
@@ -2826,6 +2828,8 @@ git commit -m "Add Scanner composition and Cleaner execution"
 
 **Files:**
 - Create: `Sources/XcodeCleaner/AppModel.swift`
+
+Примечание: `RunningAppsCheck.blockingProcesses()` бросает `CommandError`, если `pgrep` недоступен; `work()` показывает его через общий `catch`. `CleanupLogFile.appendLine(_:)` синхронный и сохраняет порядок строк.
 
 - [ ] **Step 1: Написать AppModel**
 
@@ -3112,9 +3116,7 @@ final class AppModel {
         if logFile == nil {
             logFile = try? CleanupLogFile(directory: CleanupLogFile.defaultDirectory(home: cachePaths.home))
         }
-        if let logFile {
-            Task { await logFile.append(line) }
-        }
+        logFile?.appendLine(line)
     }
 }
 ```

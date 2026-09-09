@@ -98,17 +98,17 @@ Xcode.app и toolchains, проектные кэши, а также управл
 - `CleanupItem` (struct): конкретный путь или simctl-операция, категория,
   размер, статус выполнения (`pending`/`done`/`failed(String)`).
 - `DiskSpace` (struct): свободно/занято/всего, читается из `URLResourceValues`.
-- `Scanner` (actor): только чтение. Строит `[CleanupItem]` и `[ArcMount]`
+- `Scanner` (Sendable struct): только чтение. Строит `[CleanupItem]` и `[ArcMount]`
   из allowlist путей, `xcrun simctl list -j`, `xcrun simctl runtime list -j`,
   `xcode-select -p`, `arc mount --list --json`. Размеры считает в фоне.
-- `Cleaner` (actor): единственное место удаления. Правила из скрипта:
+- `Cleaner` (Sendable struct): единственное место удаления. Правила из скрипта:
   путь в allowlist, не симлинк, содержимое каталога удаляется по элементам,
   элемент на другом `st_dev` пропускается с ошибкой. Archives, Xcode.app и
   toolchains отправляются в Корзину через `FileManager.trashItem`; кэши
   удаляются напрямую.
-- `ArcMountManager` (actor): mount/unmount/forget/rmdir через `CommandRunner`.
+- `ArcMountManager` (Sendable struct без состояния): mount/unmount/forget/rmdir(2) через `CommandRunner`; размеры store считаются отдельно и параллельно в `storeSizes(for:)`.
 - `CommandRunner` (protocol + `ProcessCommandRunner`): запуск `Process`,
-  построчный стриминг stdout/stderr в лог через `AsyncStream`.
+  построчный стриминг stdout/stderr в лог через `@Sendable` callback.
 - `AppModel` (`@Observable`, `@MainActor`): состояние UI, выбор, диск,
   прогресс, лог.
 
