@@ -4,6 +4,8 @@ public struct CommandResult: Sendable, Equatable {
     public let exitCode: Int32
     public let stdout: String
     public let stderr: String
+    /// When true, `exitCode` carries the number of the signal that killed the process rather than
+    /// an exit status — `15` means `SIGTERM`, not "the command exited with 15".
     public let terminatedBySignal: Bool
 
     public init(exitCode: Int32, stdout: String, stderr: String, terminatedBySignal: Bool = false) {
@@ -233,6 +235,8 @@ public final class ProcessCommandRunner: CommandRunning {
                 stderr: stderr,
                 terminatedBySignal: process.terminationReason == .uncaughtSignal
             )
+        } catch let error as CancellationError {
+            throw error
         } catch {
             throw CommandError(executable: executable, message: "\(error)")
         }

@@ -57,11 +57,16 @@ final class FakeCommandRunner: CommandRunning, @unchecked Sendable {
         return result
     }
 
-    /// Mirrors `ProcessCommandRunner`: both streams are reported, and empty output reports
-    /// nothing at all rather than a single empty line.
+    /// Mirrors `ProcessCommandRunner`: both streams are reported, empty output reports nothing at
+    /// all, interior blank lines are preserved, and a trailing newline terminates the last line
+    /// instead of starting an empty one.
     private static func stream(_ text: String, to onOutputLine: @Sendable (String) -> Void) {
         guard text.isEmpty == false else { return }
-        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        var lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        if text.hasSuffix("\n") {
+            lines.removeLast()
+        }
+        for line in lines {
             onOutputLine(String(line))
         }
     }

@@ -175,4 +175,66 @@ final class SafeDeleterTests: XCTestCase {
             XCTAssertFalse(reason.isEmpty)
         }
     }
+
+    func test_trashRefusesMissingLeafBehindSymlinkedParent() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let realParent = try temp.makeDirectory("real/Archives")
+        try temp.makeFile("real/Archives/keep.bin", bytes: 10)
+        _ = try temp.makeSymlink("linkdir", to: temp.url.appendingPathComponent("real"))
+        let parentThroughLink = temp.url.appendingPathComponent("linkdir/Archives")
+        let missingThroughLink = parentThroughLink.appendingPathComponent("x.xcarchive")
+        let deleter = SafeDeleter(clearableDirectories: [], trashableParents: [parentThroughLink])
+
+        XCTAssertThrowsError(try deleter.trash(missingThroughLink)) { error in
+            switch error as? SafeDeleterError {
+            case .isSymlink, .notAllowed:
+                break
+            default:
+                XCTFail("unexpected \(error)")
+            }
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: realParent.appendingPathComponent("keep.bin").path))
+    }
+
+    func test_trashRefusesSymlinkedLeaf() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let parent = try temp.makeDirectory("Archives")
+        let real = try temp.makeFile("Archives/real.xcarchive", bytes: 10)
+        let link = try temp.makeSymlink("Archives/link.xcarchive", to: real)
+        let deleter = SafeDeleter(clearableDirectories: [], trashableParents: [parent])
+
+        XCTAssertThrowsError(try deleter.trash(link)) { error in
+            XCTAssertEqual(error as? SafeDeleterError, .isSymlink(link.path))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: real.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: link.path))
+    }
+
+    func test_trashAcceptsUppercaseExtension() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let parent = try temp.makeDirectory("Archives")
+        let item = try temp.makeFile("Archives/Old.XCARCHIVE", bytes: 10)
+        let deleter = SafeDeleter(clearableDirectories: [], trashableParents: [parent])
+
+        try deleter.trash(item)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: item.path))
+    }
+
+    func test_trashRefusesMissingLeaf() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let parent = try temp.makeDirectory("Archives")
+        let missing = parent.appendingPathComponent("gone.xcarchive")
+        let deleter = SafeDeleter(clearableDirectories: [], trashableParents: [parent])
+
+        XCTAssertThrowsError(try deleter.trash(missing)) { error in
+            guard case .cannotInspect? = error as? SafeDeleterError else {
+                return XCTFail("unexpected \(error)")
+            }
+        }
+    }
 }

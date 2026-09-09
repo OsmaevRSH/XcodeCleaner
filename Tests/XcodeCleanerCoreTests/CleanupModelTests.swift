@@ -71,4 +71,18 @@ final class CleanupModelTests: XCTestCase {
         XCTAssertEqual(Set(CleanupKind.executionOrder), Set(CleanupKind.allCases))
         XCTAssertEqual(CleanupKind.executionOrder.count, CleanupKind.allCases.count)
     }
+
+    func test_cacheItemBuilderReportsSymlinkedDirectories() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let real = try temp.makeDirectory("real/DerivedData")
+        let directLink = try temp.makeSymlink("DerivedDataLink", to: real)
+        _ = try temp.makeSymlink("linkdir", to: temp.url.appendingPathComponent("real"))
+        let throughLink = temp.url.appendingPathComponent("linkdir/DerivedData")
+        let missing = temp.url.appendingPathComponent("Missing")
+
+        let skipped = CacheItemBuilder.symlinkedDirectories([real, directLink, throughLink, missing])
+
+        XCTAssertEqual(skipped.map(\.path), [directLink.path, throughLink.path])
+    }
 }

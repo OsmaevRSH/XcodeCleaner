@@ -234,4 +234,24 @@ final class CommandRunnerTests: XCTestCase {
 
         XCTAssertEqual(collector.lines, [])
     }
+
+    func test_fakeRunnerDoesNotStreamTrailingEmptyLine() async throws {
+        let runner = FakeCommandRunner()
+        runner.respond(to: "arc mount", stdout: "one\ntwo\n")
+        let collector = LineCollector()
+
+        _ = try await runner.run("arc", ["mount"]) { collector.append($0) }
+
+        XCTAssertEqual(collector.lines, ["one", "two"])
+    }
+
+    func test_fakeRunnerKeepsInteriorEmptyLines() async throws {
+        let runner = FakeCommandRunner()
+        runner.respond(to: "arc mount", stdout: "a\n\nb")
+        let collector = LineCollector()
+
+        _ = try await runner.run("arc", ["mount"]) { collector.append($0) }
+
+        XCTAssertEqual(collector.lines, ["a", "", "b"])
+    }
 }

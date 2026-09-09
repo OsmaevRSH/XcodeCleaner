@@ -49,7 +49,7 @@ public struct SafeDeleter: Sendable {
         guard clearableDirectories.contains(target.path) else {
             throw SafeDeleterError.notAllowed(directory.path)
         }
-        try Self.rejectSymlinkTraversal(directory)
+        try Self.rejectSymlinkTraversal(target, reporting: directory.path)
         let attributes = try Self.attributes(atPath: target.path, fileManager: fileManager)
         if attributes.type == .typeSymbolicLink {
             throw SafeDeleterError.isSymlink(directory.path)
@@ -79,20 +79,28 @@ public struct SafeDeleter: Sendable {
 
     public func trash(_ url: URL, fileManager: FileManager = .default) throws {
         let target = url.standardizedFileURL
-        guard trashableParents.contains(target.deletingLastPathComponent().path),
-              Self.trashableExtensions.contains(target.pathExtension)
+        let parent = target.deletingLastPathComponent()
+        guard trashableParents.contains(parent.path),
+              Self.trashableExtensions.contains(target.pathExtension.lowercased())
         else {
             throw SafeDeleterError.notAllowed(url.path)
         }
-        try Self.rejectSymlinkTraversal(url)
+        // Foundation hands back a path it could not resolve unchanged, so a check anchored on the
+        // item itself silently passes whenever the leaf is missing. The parent is allowlisted and
+        // therefore exists, which makes it the reliable anchor.
+        try Self.rejectSymlinkTraversal(parent, reporting: url.path)
+        let attributes = try Self.attributes(atPath: target.path, fileManager: fileManager)
+        guard attributes.type != .typeSymbolicLink else {
+            throw SafeDeleterError.isSymlink(url.path)
+        }
         try fileManager.trashItem(at: target, resultingItemURL: nil)
     }
 
     /// `lstat` only refuses to follow the *last* path component, so an allowlisted path whose
     /// ancestor is a symlink would still resolve to — and wipe — somewhere else entirely.
-    private static func rejectSymlinkTraversal(_ url: URL) throws {
+    private static func rejectSymlinkTraversal(_ url: URL, reporting path: String) throws {
         guard url.resolvingSymlinksInPath().path == url.standardizedFileURL.path else {
-            throw SafeDeleterError.isSymlink(url.path)
+            throw SafeDeleterError.isSymlink(path)
         }
     }
 

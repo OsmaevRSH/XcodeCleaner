@@ -170,4 +170,22 @@ public enum CacheItemBuilder {
             )
         }
     }
+
+    /// The directories `items` silently drops because they are symlinks or sit behind one, so a
+    /// scanner can surface them as warnings instead of leaving the user wondering where a cache
+    /// they can see went.
+    public static func symlinkedDirectories(
+        _ directories: [URL],
+        fileManager: FileManager = .default
+    ) -> [URL] {
+        directories.filter { directory in
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+                  isDirectory.boolValue
+            else {
+                return false
+            }
+            return directory.resolvingSymlinksInPath().path != directory.standardizedFileURL.path
+        }
+    }
 }
