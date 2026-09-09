@@ -4,11 +4,13 @@ public struct CommandResult: Sendable, Equatable {
     public let exitCode: Int32
     public let stdout: String
     public let stderr: String
+    public let terminatedBySignal: Bool
 
-    public init(exitCode: Int32, stdout: String, stderr: String) {
+    public init(exitCode: Int32, stdout: String, stderr: String, terminatedBySignal: Bool = false) {
         self.exitCode = exitCode
         self.stdout = stdout
         self.stderr = stderr
+        self.terminatedBySignal = terminatedBySignal
     }
 
     public var succeeded: Bool { exitCode == 0 }
@@ -82,15 +84,27 @@ public struct ExecutableLocator: Sendable {
 
     public func resolve(_ name: String) -> String? {
         if name.contains("/") {
-            return FileManager.default.isExecutableFile(atPath: name) ? name : nil
+            return Self.isRunnableFile(atPath: name) ? name : nil
         }
         for directory in searchDirectories {
             let candidate = (directory as NSString).appendingPathComponent(name)
-            if FileManager.default.isExecutableFile(atPath: candidate) {
+            if Self.isRunnableFile(atPath: candidate) {
                 return candidate
             }
         }
         return nil
+    }
+
+    /// `isExecutableFile(atPath:)` is true for directories too (the execute bit means "searchable"
+    /// there), so a bare path like `/tmp` would otherwise be handed to `Process` and fail at spawn.
+    private static func isRunnableFile(atPath path: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              isDirectory.boolValue == false
+        else {
+            return false
+        }
+        return FileManager.default.isExecutableFile(atPath: path)
     }
 }
 
@@ -127,34 +141,58 @@ public final class ProcessCommandRunner: CommandRunning {
 
         return try await withTaskCancellationHandler {
             try await Self.runAndCollect(
-                process: process,
+                box: processBox,
                 executable: executable,
                 stdoutPipe: stdoutPipe,
                 stderrPipe: stderrPipe,
                 onOutputLine: onOutputLine
             )
         } onCancel: {
-            processBox.process.terminate()
+            processBox.terminate()
         }
     }
 
-    /// Not Sendable itself, but only ever touched from the `onCancel` closure of
-    /// `withTaskCancellationHandler`, which cannot run concurrently with the rest of `run`.
+    /// `onCancel` of `withTaskCancellationHandler` runs synchronously on whichever thread calls
+    /// `cancel()`, and it runs immediately (before the body) when the task is already cancelled —
+    /// so it *can* race the launch. `Process.terminate()` raises an uncatchable
+    /// `NSInvalidArgumentException` when the task was never launched, so launch and terminate are
+    /// serialised here and cancellation that wins the race prevents the launch altogether.
     private final class ProcessBox: @unchecked Sendable {
         let process: Process
+        private let lock = NSLock()
+        private var launched = false
+        private var cancelled = false
 
         init(process: Process) {
             self.process = process
         }
+
+        func launch() throws {
+            try lock.withLock {
+                if cancelled { throw CancellationError() }
+                try process.run()
+                launched = true
+            }
+        }
+
+        func terminate() {
+            lock.withLock {
+                cancelled = true
+                if launched, process.isRunning {
+                    process.terminate()
+                }
+            }
+        }
     }
 
     private static func runAndCollect(
-        process: Process,
+        box: ProcessBox,
         executable: String,
         stdoutPipe: Pipe,
         stderrPipe: Pipe,
         onOutputLine: (@Sendable (String) -> Void)?
     ) async throws -> CommandResult {
+        let process = box.process
         // Draining must start before we await process termination: pipes have a 64KB buffer,
         // and a process that fills it while nobody is reading will block forever, which would
         // in turn block termination and deadlock this function.
@@ -166,17 +204,35 @@ public final class ProcessCommandRunner: CommandRunning {
                 continuation.resume(returning: finishedProcess.terminationStatus)
             }
             do {
-                try process.run()
+                try box.launch()
             } catch {
+                // Nothing was spawned, so this process still holds the only copies of the pipes'
+                // write ends. Unless they are closed the readers above never see EOF, and the
+                // implicit await that unwinds the `async let` bindings would hang forever.
                 process.terminationHandler = nil
-                continuation.resume(throwing: CommandError(executable: executable, message: error.localizedDescription))
+                try? stdoutPipe.fileHandleForWriting.close()
+                try? stderrPipe.fileHandleForWriting.close()
+                if error is CancellationError {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume(
+                        throwing: CommandError(executable: executable, message: error.localizedDescription)
+                    )
+                }
             }
         }
+        process.terminationHandler = nil
+        try Task.checkCancellation()
 
         do {
             let stdout = try await stdoutText
             let stderr = try await stderrText
-            return CommandResult(exitCode: exitCode, stdout: stdout, stderr: stderr)
+            return CommandResult(
+                exitCode: exitCode,
+                stdout: stdout,
+                stderr: stderr,
+                terminatedBySignal: process.terminationReason == .uncaughtSignal
+            )
         } catch {
             throw CommandError(executable: executable, message: "\(error)")
         }

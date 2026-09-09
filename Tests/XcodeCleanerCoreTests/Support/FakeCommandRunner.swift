@@ -51,10 +51,18 @@ final class FakeCommandRunner: CommandRunning, @unchecked Sendable {
             throw throwing
         }
         if let onOutputLine {
-            for line in result.stdout.split(separator: "\n") {
-                onOutputLine(String(line))
-            }
+            Self.stream(result.stdout, to: onOutputLine)
+            Self.stream(result.stderr, to: onOutputLine)
         }
         return result
+    }
+
+    /// Mirrors `ProcessCommandRunner`: both streams are reported, and empty output reports
+    /// nothing at all rather than a single empty line.
+    private static func stream(_ text: String, to onOutputLine: @Sendable (String) -> Void) {
+        guard text.isEmpty == false else { return }
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            onOutputLine(String(line))
+        }
     }
 }

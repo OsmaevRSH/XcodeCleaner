@@ -14,7 +14,55 @@ private func canonicalPath(_ path: String) -> String {
     return buffer.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
 }
 
+private final class OutcomeBox<Success>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: Result<Success, Error>?
+
+    var outcome: Result<Success, Error>? { lock.withLock { storage } }
+
+    func store(_ value: Result<Success, Error>) {
+        lock.withLock { storage = value }
+    }
+}
+
 final class CommandRunnerTests: XCTestCase {
+    /// Runs `body` on its own task and returns `nil` if it did not finish in time, so a
+    /// regression that reintroduces a hang is reported as a failed test instead of freezing
+    /// the whole suite.
+    private func outcome<Success: Sendable>(
+        within seconds: TimeInterval = 5,
+        of body: @escaping @Sendable () async throws -> Success
+    ) async -> Result<Success, Error>? {
+        let box = OutcomeBox<Success>()
+        let finished = expectation(description: "command finished")
+        Task {
+            do {
+                box.store(.success(try await body()))
+            } catch {
+                box.store(.failure(error))
+            }
+            finished.fulfill()
+        }
+        await fulfillment(of: [finished], timeout: seconds)
+        return box.outcome
+    }
+
+    private func assertThrows<Success>(
+        _ outcome: Result<Success, Error>?,
+        _ check: (Error) -> Void,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        switch outcome {
+        case nil:
+            XCTFail("did not finish within the timeout", file: file, line: line)
+        case .success:
+            XCTFail("expected a thrown error", file: file, line: line)
+        case .failure(let error):
+            check(error)
+        }
+    }
+
     func test_echoReturnsStdoutAndZeroExit() async throws {
         let runner = ProcessCommandRunner()
         let result = try await runner.run("echo", ["hello"])
@@ -58,6 +106,12 @@ final class CommandRunnerTests: XCTestCase {
         XCTAssertNil(locator.resolve("no-such-binary-xyz"))
     }
 
+    func test_locatorRejectsDirectoryPath() {
+        XCTAssertNil(ExecutableLocator.standard.resolve("/tmp"))
+        XCTAssertNil(ExecutableLocator.standard.resolve("/usr/bin"))
+        XCTAssertEqual(ExecutableLocator.standard.resolve("/bin/ls"), "/bin/ls")
+    }
+
     func test_currentDirectoryOverloadRunsInGivenDirectory() async throws {
         let runner = ProcessCommandRunner()
         let temp = try TemporaryDirectory()
@@ -84,14 +138,68 @@ final class CommandRunnerTests: XCTestCase {
         XCTAssertEqual(result.stdout.split(separator: "\n").count, 20000)
     }
 
+    func test_failureToLaunchThrowsInsteadOfHanging() async {
+        let runner = ProcessCommandRunner()
+        let missing = URL(fileURLWithPath: "/tmp/no-such-dir-\(UUID().uuidString)")
+        let outcome = await outcome {
+            try await runner.run("pwd", [], currentDirectory: missing) { _ in }
+        }
+        assertThrows(outcome) { error in
+            XCTAssertTrue(error is CommandError, "unexpected \(error)")
+        }
+    }
+
     func test_cancellationTerminatesProcess() async throws {
         let runner = ProcessCommandRunner()
-        let task = Task { try await runner.run("sleep", ["30"]) }
-        try await Task.sleep(for: .milliseconds(300))
-        task.cancel()
-        let started = Date()
-        _ = try? await task.value
-        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        let outcome = await outcome {
+            let task = Task { try await runner.run("sleep", ["30"]) }
+            try await Task.sleep(for: .milliseconds(300))
+            task.cancel()
+            return try await task.value
+        }
+        assertThrows(outcome) { error in
+            XCTAssertTrue(error is CancellationError, "unexpected \(error)")
+        }
+    }
+
+    func test_cancellationRacingLaunchDoesNotCrash() async {
+        let runner = ProcessCommandRunner()
+        let outcome = await outcome {
+            let task = Task { try await runner.run("sleep", ["30"]) }
+            task.cancel()
+            return try await task.value
+        }
+        assertThrows(outcome) { error in
+            XCTAssertTrue(error is CancellationError, "unexpected \(error)")
+        }
+    }
+
+    func test_cancellationBeforeLaunchThrowsCancellationError() async {
+        let runner = ProcessCommandRunner()
+        let outcome = await outcome {
+            let task = Task { () -> CommandResult in
+                while Task.isCancelled == false {
+                    try? await Task.sleep(for: .milliseconds(5))
+                }
+                return try await runner.run("sleep", ["30"])
+            }
+            task.cancel()
+            return try await task.value
+        }
+        assertThrows(outcome) { error in
+            XCTAssertTrue(error is CancellationError, "unexpected \(error)")
+        }
+    }
+
+    func test_terminationReasonIsReportedForSignalledProcess() async throws {
+        let runner = ProcessCommandRunner()
+
+        let normal = try await runner.run("sh", ["-c", "exit 0"])
+        XCTAssertFalse(normal.terminatedBySignal)
+
+        let signalled = try await runner.run("sh", ["-c", "kill -TERM $$; sleep 5"])
+        XCTAssertTrue(signalled.terminatedBySignal)
+        XCTAssertEqual(signalled.exitCode, 15)
     }
 
     func test_fakeRunnerCanThrow() async {
@@ -106,5 +214,24 @@ final class CommandRunnerTests: XCTestCase {
             XCTFail("unexpected \(error)")
         }
         XCTAssertEqual(runner.callLines, ["arc mount"])
+    }
+
+    func test_fakeRunnerStreamsStdoutAndStderrLines() async throws {
+        let runner = FakeCommandRunner()
+        runner.respond(to: "arc mount", stdout: "one\ntwo", stderr: "bad")
+        let collector = LineCollector()
+
+        _ = try await runner.run("arc", ["mount"]) { collector.append($0) }
+
+        XCTAssertEqual(collector.lines, ["one", "two", "bad"])
+    }
+
+    func test_fakeRunnerStreamsNothingForEmptyOutput() async throws {
+        let runner = FakeCommandRunner()
+        let collector = LineCollector()
+
+        _ = try await runner.run("arc", ["mount"]) { collector.append($0) }
+
+        XCTAssertEqual(collector.lines, [])
     }
 }
