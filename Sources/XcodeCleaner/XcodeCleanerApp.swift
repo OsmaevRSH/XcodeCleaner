@@ -2,10 +2,13 @@ import SwiftUI
 
 @main
 struct XcodeCleanerApp: App {
+    @State private var model = AppModel()
+
     var body: some Scene {
         WindowGroup("XcodeCleaner") {
-            Text("XcodeCleaner")
-                .frame(minWidth: 400, minHeight: 300)
+            RootView(model: model)
+                .frame(minWidth: 900, minHeight: 600)
         }
+        .windowResizability(.contentMinSize)
     }
 }
