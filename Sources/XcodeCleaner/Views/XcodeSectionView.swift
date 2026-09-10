@@ -78,7 +78,8 @@ struct XcodeSectionView: View {
             Image(systemName: "chevron.right")
                 .rotationEffect(.degrees(isExpanded ? 90 : 0))
                 .foregroundStyle(.secondary)
-                .frame(width: 28, height: 24)
+                .frame(width: 44)
+                .frame(maxHeight: .infinity)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
