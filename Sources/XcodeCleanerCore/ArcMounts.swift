@@ -91,7 +91,8 @@ public struct ArcMountManager: Sendable {
     public var mainMountPath: String { home.appendingPathComponent("arcadia").path }
 
     /// The only directory arc keeps per-mount stores in, and therefore the only directory this
-    /// manager ever deletes recursively.
+    /// manager ever deletes recursively. Containing a path here is a check on its *spelling*, not
+    /// on where it leads — see `refuseUnsafeStore(_:log:)` for the rest of the guard.
     public var storesRootPath: String { home.appendingPathComponent(".arc/stores").path }
 
     /// The spelling handed back to `arc` and `rmdir`: `arc` may report a mount with a trailing
@@ -147,10 +148,13 @@ public struct ArcMountManager: Sendable {
     /// moves it — while the store root's own mtime stays at the moment the store was created. The
     /// metadata directory is therefore the honest answer to "when was this mount last touched"; the
     /// root is only a fallback for a store arc has not populated yet.
-    public static func lastUsed(ofStore store: String, fileManager: FileManager) -> Date? {
-        let root = URL(fileURLWithPath: store)
-        return modificationDate(of: root.appendingPathComponent(".arc").path, fileManager: fileManager)
-            ?? modificationDate(of: root.path, fileManager: fileManager)
+    /// The store is spelled the way `arc` reported it, which may be a `~` path — and
+    /// `URL(fileURLWithPath:)` would resolve that against the process's current directory instead
+    /// of this manager's home — so it goes through the same normalisation as every other path here.
+    public func lastUsed(ofStore store: String) -> Date? {
+        let root = URL(fileURLWithPath: normalizedPath(store))
+        return Self.modificationDate(of: root.appendingPathComponent(".arc").path, fileManager: fileManager)
+            ?? Self.modificationDate(of: root.path, fileManager: fileManager)
     }
 
     /// Sizing the per-mount stores walks tens of gigabytes, so each store is walked in its own
@@ -205,7 +209,7 @@ public struct ArcMountManager: Sendable {
                 storeSizeBytes: nil,
                 isMain: comparablePath(mount.mount) == mainPath,
                 sharesMainObjectStore: main.map { $0.objectStore == mount.objectStore } ?? false,
-                lastUsedAt: Self.lastUsed(ofStore: mount.store, fileManager: fileManager)
+                lastUsedAt: lastUsed(ofStore: mount.store)
             )
         }
     }
@@ -214,7 +218,7 @@ public struct ArcMountManager: Sendable {
         try refuseUnsafePath(mountPath)
         let result = try await runUnmount(normalizedPath(mountPath), force: force, log: log)
         guard result.succeeded else {
-            throw ArcMountError.commandFailed("arc unmount", result.stderr)
+            throw ArcMountError.commandFailed("arc unmount", Self.output(of: result))
         }
     }
 
@@ -224,19 +228,27 @@ public struct ArcMountManager: Sendable {
     /// `arc` is best-effort here. It exits 1 for a repository that is already unmounted and again
     /// for a path it no longer recognises, and neither answer means the user's intent — "delete
     /// this mount and everything behind it" — is out of reach: the store is still there to delete.
-    /// Only a run that neither convinced `arc` nor freed the store is reported as a failure.
-    public func remove(_ mount: ArcMount, log: @escaping Log) async throws {
+    /// A run is only reported as a failure when it neither convinced `arc` nor left the machine in
+    /// the state the user asked for.
+    ///
+    /// - Parameter knownStoreSize: the size the caller already measured for this store, logged as
+    ///   the space freed. Nothing is measured here: this is the destructive path, and walking a
+    ///   multi-gigabyte store again to print a number the UI has already shown would block the
+    ///   removal for as long as the scan did.
+    public func remove(_ mount: ArcMount, knownStoreSize: Int64?, log: @escaping Log) async throws {
         guard comparablePath(mount.mount) != comparablePath(mainMountPath) else {
             throw ArcMountError.mainMountProtected
         }
         try refuseUnsafePath(mount.mount)
+        try refuseUnsafeStore(mount.store, log: log)
         let path = normalizedPath(mount.mount)
 
         if mount.isMounted {
             let result = try await runUnmount(path, force: false, log: log)
             if result.succeeded == false {
-                guard Self.output(of: result).lowercased().contains("already unmounted") else {
-                    throw ArcMountError.commandFailed("arc unmount", result.stderr)
+                let output = Self.output(of: result)
+                guard output.lowercased().contains(Self.alreadyUnmountedMessage) else {
+                    throw ArcMountError.commandFailed("arc unmount", output)
                 }
                 log("Маунт \(path) уже размонтирован, продолжаем")
             }
@@ -249,12 +261,22 @@ public struct ArcMountManager: Sendable {
             log("arc не забыла маунт \(path), удаляем стор сами")
         }
 
-        let storeRemoved = try removeStore(mount.store, log: log)
+        let storeRemoval = try removeStore(mount.store, knownSize: knownStoreSize, log: log)
         removeEmptyMountDirectory(path, log: log)
 
-        if forgetResult.succeeded == false, storeRemoved == false {
-            throw ArcMountError.commandFailed("arc unmount --forget", Self.output(of: forgetResult))
+        if forgetResult.succeeded == false, storeRemoval != .removed {
+            // A repeat of a stale list is not a failure: `arc` no longer knows the mount, the store
+            // is already gone and so is the mount directory, which is exactly what was asked for.
+            guard storeRemoval == .absent, fileManager.fileExists(atPath: path) == false else {
+                throw ArcMountError.commandFailed("arc unmount --forget", Self.output(of: forgetResult))
+            }
+            log("Маунт \(path) и его стор уже удалены, удалять нечего")
         }
+    }
+
+    /// Removes the mount without reporting how much space its store took.
+    public func remove(_ mount: ArcMount, log: @escaping Log) async throws {
+        try await remove(mount, knownStoreSize: nil, log: log)
     }
 
     private func runUnmount(_ path: String, force: Bool, log: @escaping Log) async throws -> CommandResult {
@@ -265,29 +287,69 @@ public struct ArcMountManager: Sendable {
         return try await runner.run("arc", arguments, currentDirectory: home, onOutputLine: log)
     }
 
+    /// The exact sentence `arc` prints for a mount that is no longer live. Matched in full because
+    /// anything shorter also matches a hint like "if the repository is already unmounted, use
+    /// --forget" — which arrives *with* a genuine failure such as a busy mount, and swallowing
+    /// that would point the store deletion at a mount the user is still working in.
+    private static let alreadyUnmountedMessage = "repository seems to be already unmounted"
+
+    /// Whether the store directory is gone, and whether this call is the reason.
+    private enum StoreRemoval {
+        case removed
+        case absent
+        case failed
+    }
+
     /// The fallback for a store that `arc unmount --forget` left behind: it is gigabytes of this
-    /// mount's own objects and the user asked for it to go. Confined to `~/.arc/stores/`, the only
-    /// place arc keeps per-mount stores, so a mangled `store` field can never aim the recursive
-    /// delete at the user's own files. The main mount never gets here — `remove(_:log:)` refuses it
-    /// before anything runs.
-    ///
-    /// - Returns: whether the store directory is gone because of this call.
-    private func removeStore(_ store: String, log: Log) throws -> Bool {
+    /// mount's own objects and the user asked for it to go. `remove(_:knownStoreSize:log:)` has
+    /// already refused the main mount and vetted this path once, but two `arc` invocations run in
+    /// between — so the guard is re-run here rather than assumed, and it is the one immediately
+    /// before `removeItem` that actually protects the delete.
+    private func removeStore(_ store: String, knownSize: Int64?, log: Log) throws -> StoreRemoval {
         let path = normalizedPath(store)
-        guard fileManager.fileExists(atPath: path) else { return false }
-        guard isStrictlyInside(path, of: storesRootPath) else {
-            log("Стор \(path) лежит вне \(storesRootPath), удаление отклонено")
-            throw ArcMountError.refusedPath(store)
-        }
-        let freed = DirectorySizer.size(of: URL(fileURLWithPath: path), fileManager: FileManager())
+        guard fileManager.fileExists(atPath: path) else { return .absent }
+        try refuseUnsafeStore(store, log: log)
         do {
             try fileManager.removeItem(atPath: path)
-            log("Удалена папка стора \(path), освобождено \(ByteFormatting.string(freed))")
-            return true
+            let freed = knownSize.map { ", освобождено \(ByteFormatting.string($0))" } ?? ""
+            log("Удалена папка стора \(path)\(freed)")
+            return .removed
         } catch {
             log("Не удалось удалить папку стора \(path): \(error.localizedDescription)")
-            return false
+            return .failed
         }
+    }
+
+    /// Refuses any store the recursive delete must never be aimed at. Runs once before `arc` is
+    /// asked to do anything — so a malformed `store` field cannot leave the mount torn down but not
+    /// removed — and again immediately before the delete itself.
+    ///
+    /// Confinement to `~/.arc/stores/` — the only place arc keeps per-mount stores — is purely
+    /// lexical: `standardizedFileURL` resolves `..` but never a symlink, so `<stores>/link/victim`
+    /// satisfies it while `removeItem` walks straight out of the stores root. A store that is
+    /// itself a symlink is refused for the opposite reason: deleting it reaches the tree behind the
+    /// link instead of the store, and even when it only unlinks, nothing is actually freed. Both
+    /// are settled against the filesystem, the same way `SafeDeleter` does it.
+    ///
+    /// A store that is not on disk at all is nothing to aim at and no reason to refuse the removal:
+    /// `arc unmount --forget` may still have work to do, and `removeStore(_:knownSize:log:)`
+    /// reports the store as absent afterwards.
+    private func refuseUnsafeStore(_ store: String, log: Log) throws {
+        let path = normalizedPath(store)
+        guard let type = Self.fileType(of: path, fileManager: fileManager) else { return }
+        let url = URL(fileURLWithPath: path)
+        let reason: String
+        if isStrictlyInside(path, of: storesRootPath) == false {
+            reason = "лежит вне \(storesRootPath)"
+        } else if url.resolvingSymlinksInPath().path != url.standardizedFileURL.path {
+            reason = "ведёт через симлинк"
+        } else if type == .typeSymbolicLink {
+            reason = "сам является симлинком"
+        } else {
+            return
+        }
+        log("Стор \(path) \(reason), удаление отклонено")
+        throw ArcMountError.refusedPath(store)
     }
 
     /// `arc` puts its diagnostics on either stream depending on the subcommand, so both are read
@@ -301,6 +363,12 @@ public struct ArcMountManager: Sendable {
 
     private static func modificationDate(of path: String, fileManager: FileManager) -> Date? {
         (try? fileManager.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+    }
+
+    /// Nil when nothing is there. `attributesOfItem(atPath:)` follows the intermediate components
+    /// but not the last one, so a symlink reports itself rather than what it points at.
+    private static func fileType(of path: String, fileManager: FileManager) -> FileAttributeType? {
+        (try? fileManager.attributesOfItem(atPath: path))?[.type] as? FileAttributeType
     }
 
     /// `--forget` deletes the mount's store and `unmount` tears down a live FUSE mount, so a

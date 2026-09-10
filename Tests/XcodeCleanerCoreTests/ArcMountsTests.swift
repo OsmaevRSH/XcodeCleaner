@@ -75,6 +75,25 @@ final class ArcMountsTests: XCTestCase {
         }
     }
 
+    func test_unmountFailureReportsDiagnosticsWrittenToStdout() async {
+        let runner = FakeCommandRunner()
+        runner.respond(
+            to: "arc unmount /Users/tester/arcadia_SAFTIOS-2",
+            stdout: "Not an arc repository.",
+            exitCode: 1
+        )
+        let manager = ArcMountManager(runner: runner, home: URL(fileURLWithPath: "/Users/tester"))
+
+        do {
+            try await manager.unmount("/Users/tester/arcadia_SAFTIOS-2", force: false) { _ in }
+            XCTFail("expected throw")
+        } catch let error as ArcMountError {
+            XCTAssertEqual(error, .commandFailed("arc unmount", "Not an arc repository."))
+        } catch {
+            XCTFail("unexpected \(error)")
+        }
+    }
+
     func test_removeUnmountsIfMountedThenForgetsAndRemovesEmptyDir() async throws {
         let temp = try TemporaryDirectory()
         defer { temp.remove() }
@@ -135,6 +154,35 @@ final class ArcMountsTests: XCTestCase {
         XCTAssertTrue(logged.contains("уже размонтирован"))
     }
 
+    /// `arc` writes `[DEBUG]` traces to stderr and hints to stdout, so a failure that merely
+    /// mentions the words "already unmounted" is not the sentence that means the mount is gone.
+    /// Swallowing it would let a live, busy mount reach the store deletion below.
+    func test_removeThrowsWhenOutputOnlyHintsAtAlreadyUnmounted() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let mountDir = try temp.makeDirectory("arcadia_SAFTIOS-9")
+        let store = try temp.makeDirectory(".arc/stores/_arcadia_SAFTIOS-9")
+        try temp.makeFile(".arc/stores/_arcadia_SAFTIOS-9/blob.bin", bytes: 4096)
+        let hint = "error: mount is busy; if the repository is already unmounted, use --forget"
+        let runner = FakeCommandRunner()
+        runner.respond(to: "arc unmount \(mountDir.path)", stdout: hint, exitCode: 1)
+        let manager = ArcMountManager(runner: runner, home: temp.url)
+        let mount = ArcMount(status: .mounted, mount: mountDir.path, store: store.path, objectStore: "/o")
+
+        do {
+            try await manager.remove(mount) { _ in }
+            XCTFail("expected throw")
+        } catch let error as ArcMountError {
+            XCTAssertEqual(error, .commandFailed("arc unmount", hint))
+        } catch {
+            XCTFail("unexpected \(error)")
+        }
+        XCTAssertEqual(runner.callLines, ["arc unmount \(mountDir.path)"])
+        XCTAssertTrue(exists(store))
+        XCTAssertTrue(exists(store.appendingPathComponent("blob.bin")))
+        XCTAssertTrue(exists(mountDir))
+    }
+
     func test_removeThrowsWhenUnmountFailsForAnotherReason() async throws {
         let temp = try TemporaryDirectory()
         defer { temp.remove() }
@@ -182,7 +230,9 @@ final class ArcMountsTests: XCTestCase {
         XCTAssertTrue(logged.contains(store.path))
     }
 
-    func test_removeThrowsWhenForgetFailsAndStoreIsMissing() async throws {
+    /// A repeat of a stale list: `arc` no longer knows the mount, the store is gone and the mount
+    /// directory goes with it. There is nothing left to fail at, so this is not an error.
+    func test_removeSucceedsWhenForgetFailsAndNothingIsLeftToRemove() async throws {
         let temp = try TemporaryDirectory()
         defer { temp.remove() }
         let mountDir = try temp.makeDirectory("arcadia_SAFTIOS-7")
@@ -196,6 +246,32 @@ final class ArcMountsTests: XCTestCase {
         let manager = ArcMountManager(runner: runner, home: temp.url)
         let mount = ArcMount(status: .unmounted, mount: mountDir.path, store: store.path, objectStore: "/o")
 
+        try await manager.remove(mount) { _ in }
+
+        XCTAssertFalse(exists(store))
+        XCTAssertFalse(exists(mountDir))
+    }
+
+    /// The genuine failure: `arc` refused and the store is still on disk afterwards.
+    func test_removeThrowsWhenForgetFailsAndStoreCannotBeRemoved() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let mountDir = try temp.makeDirectory("arcadia_SAFTIOS-11")
+        let store = try temp.makeDirectory(".arc/stores/_arcadia_SAFTIOS-11")
+        try temp.makeFile(".arc/stores/_arcadia_SAFTIOS-11/blob.bin", bytes: 4096)
+        let runner = FakeCommandRunner()
+        runner.respond(
+            to: "arc unmount --forget \(mountDir.path)",
+            stdout: "Not an arc repository.",
+            exitCode: 1
+        )
+        let manager = ArcMountManager(
+            runner: runner,
+            home: temp.url,
+            fileManager: UnremovableFileManager()
+        )
+        let mount = ArcMount(status: .unmounted, mount: mountDir.path, store: store.path, objectStore: "/o")
+
         do {
             try await manager.remove(mount) { _ in }
             XCTFail("expected throw")
@@ -204,6 +280,7 @@ final class ArcMountsTests: XCTestCase {
         } catch {
             XCTFail("unexpected \(error)")
         }
+        XCTAssertTrue(exists(store))
     }
 
     func test_removeRefusesStoreOutsideArcStores() async throws {
@@ -215,11 +292,6 @@ final class ArcMountsTests: XCTestCase {
         let store = try outside.makeDirectory("evil")
         try outside.makeFile("evil/precious.bin", bytes: 512)
         let runner = FakeCommandRunner()
-        runner.respond(
-            to: "arc unmount --forget \(mountDir.path)",
-            stdout: "Not an arc repository.",
-            exitCode: 1
-        )
         let manager = ArcMountManager(runner: runner, home: temp.url)
         let mount = ArcMount(status: .unmounted, mount: mountDir.path, store: store.path, objectStore: "/o")
         let logged = LineCollector()
@@ -235,7 +307,95 @@ final class ArcMountsTests: XCTestCase {
         XCTAssertTrue(exists(store))
         XCTAssertTrue(exists(store.appendingPathComponent("precious.bin")))
         XCTAssertTrue(exists(mountDir))
-        XCTAssertTrue(logged.contains("Not an arc repository."))
+        XCTAssertTrue(runner.callLines.isEmpty)
+        XCTAssertTrue(logged.contains(store.path))
+    }
+
+    /// Containment is lexical, so `<stores>/linkdir/victim` looks like it lives in the stores root
+    /// even when `linkdir` points anywhere else on the disk.
+    func test_removeRefusesStoreBehindASymlinkedAncestor() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let mountDir = try temp.makeDirectory("arcadia_SAFTIOS-12")
+        try temp.makeDirectory(".arc/stores")
+        let outside = try temp.makeDirectory("outside")
+        let precious = try temp.makeFile("outside/victim/precious.bin", bytes: 512)
+        _ = try temp.makeSymlink(".arc/stores/linkdir", to: outside)
+        let store = temp.url.appendingPathComponent(".arc/stores/linkdir/victim")
+        let runner = FakeCommandRunner()
+        let manager = ArcMountManager(runner: runner, home: temp.url)
+        let mount = ArcMount(status: .unmounted, mount: mountDir.path, store: store.path, objectStore: "/o")
+        let logged = LineCollector()
+
+        do {
+            try await manager.remove(mount) { logged.append($0) }
+            XCTFail("expected throw")
+        } catch let error as ArcMountError {
+            XCTAssertEqual(error, .refusedPath(store.path))
+        } catch {
+            XCTFail("unexpected \(error)")
+        }
+        XCTAssertTrue(exists(precious))
+        XCTAssertTrue(exists(outside.appendingPathComponent("victim")))
+        XCTAssertTrue(runner.callLines.isEmpty)
+        XCTAssertTrue(logged.contains(store.path))
+    }
+
+    /// Unlinking a symlinked store would leave every byte behind it in place while the log claimed
+    /// the space was freed, so the store itself has to be a real directory.
+    func test_removeRefusesStoreThatIsItselfASymlink() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let mountDir = try temp.makeDirectory("arcadia_SAFTIOS-13")
+        try temp.makeDirectory(".arc/stores")
+        let target = try temp.makeDirectory("elsewhere")
+        let precious = try temp.makeFile("elsewhere/precious.bin", bytes: 512)
+        let store = try temp.makeSymlink(".arc/stores/_arcadia_SAFTIOS-13", to: target)
+        let runner = FakeCommandRunner()
+        let manager = ArcMountManager(runner: runner, home: temp.url)
+        let mount = ArcMount(status: .unmounted, mount: mountDir.path, store: store.path, objectStore: "/o")
+        let logged = LineCollector()
+
+        do {
+            try await manager.remove(mount) { logged.append($0) }
+            XCTFail("expected throw")
+        } catch let error as ArcMountError {
+            XCTAssertEqual(error, .refusedPath(store.path))
+        } catch {
+            XCTFail("unexpected \(error)")
+        }
+        XCTAssertTrue(exists(precious))
+        XCTAssertTrue(exists(store))
+        XCTAssertTrue(runner.callLines.isEmpty)
+        XCTAssertTrue(logged.contains(store.path))
+    }
+
+    /// Two `arc` invocations run between validating the store path and deleting it, so the check
+    /// that guards the delete has to be the one next to `removeItem`, not only the one up front.
+    func test_removeRefusesAStoreThatTurnsIntoASymlinkWhileArcRuns() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let mountDir = try temp.makeDirectory("arcadia_SAFTIOS-14")
+        try temp.makeDirectory(".arc/stores")
+        let target = try temp.makeDirectory("elsewhere")
+        let precious = try temp.makeFile("elsewhere/precious.bin", bytes: 512)
+        let store = temp.url.appendingPathComponent(".arc/stores/_arcadia_SAFTIOS-14")
+        let runner = SideEffectCommandRunner {
+            try? FileManager.default.createSymbolicLink(at: store, withDestinationURL: target)
+        }
+        let manager = ArcMountManager(runner: runner, home: temp.url)
+        let mount = ArcMount(status: .unmounted, mount: mountDir.path, store: store.path, objectStore: "/o")
+
+        do {
+            try await manager.remove(mount) { _ in }
+            XCTFail("expected throw")
+        } catch let error as ArcMountError {
+            XCTAssertEqual(error, .refusedPath(store.path))
+        } catch {
+            XCTFail("unexpected \(error)")
+        }
+        XCTAssertTrue(exists(precious))
+        XCTAssertTrue(exists(target))
     }
 
     func test_removeKeepsNonEmptyDirectory() async throws {
@@ -534,8 +694,9 @@ final class ArcMountsTests: XCTestCase {
             [.modificationDate: Date(timeIntervalSince1970: 1_000_000)],
             ofItemAtPath: store.path
         )
+        let manager = ArcMountManager(runner: FakeCommandRunner(), home: temp.url)
 
-        let date = ArcMountManager.lastUsed(ofStore: store.path, fileManager: .default)
+        let date = manager.lastUsed(ofStore: store.path)
 
         XCTAssertEqual(date?.timeIntervalSince1970 ?? 0, expected.timeIntervalSince1970, accuracy: 1)
     }
@@ -546,8 +707,9 @@ final class ArcMountsTests: XCTestCase {
         let store = try temp.makeDirectory("store")
         let expected = Date(timeIntervalSince1970: 1_600_000_000)
         try FileManager.default.setAttributes([.modificationDate: expected], ofItemAtPath: store.path)
+        let manager = ArcMountManager(runner: FakeCommandRunner(), home: temp.url)
 
-        let date = ArcMountManager.lastUsed(ofStore: store.path, fileManager: .default)
+        let date = manager.lastUsed(ofStore: store.path)
 
         XCTAssertEqual(date?.timeIntervalSince1970 ?? 0, expected.timeIntervalSince1970, accuracy: 1)
     }
@@ -555,13 +717,26 @@ final class ArcMountsTests: XCTestCase {
     func test_lastUsedIsNilWhenStoreIsMissing() throws {
         let temp = try TemporaryDirectory()
         defer { temp.remove() }
+        let manager = ArcMountManager(runner: FakeCommandRunner(), home: temp.url)
 
-        let date = ArcMountManager.lastUsed(
-            ofStore: temp.url.appendingPathComponent("gone").path,
-            fileManager: .default
-        )
+        let date = manager.lastUsed(ofStore: temp.url.appendingPathComponent("gone").path)
 
         XCTAssertNil(date)
+    }
+
+    /// `arc` may spell a store with a `~`, and `URL(fileURLWithPath:)` would resolve that against
+    /// the current directory instead of the home this manager was given.
+    func test_lastUsedNormalizesTildeSpelledStore() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let metadata = try temp.makeDirectory(".arc/stores/_arcadia_SAFTIOS-1/.arc")
+        let expected = Date(timeIntervalSince1970: 1_500_000_000)
+        try FileManager.default.setAttributes([.modificationDate: expected], ofItemAtPath: metadata.path)
+        let manager = ArcMountManager(runner: FakeCommandRunner(), home: temp.url)
+
+        let date = manager.lastUsed(ofStore: "~/.arc/stores/_arcadia_SAFTIOS-1")
+
+        XCTAssertEqual(date?.timeIntervalSince1970 ?? 0, expected.timeIntervalSince1970, accuracy: 1)
     }
 
     func test_listReadsLastUsedFromStoreMetadata() async throws {
@@ -594,6 +769,34 @@ final class ArcMountsTests: XCTestCase {
             accuracy: 1
         )
         XCTAssertNil(infos[1].lastUsedAt)
+    }
+}
+
+/// Succeeds at everything and changes the filesystem while it does, so a test can act inside the
+/// window between validating a path and using it.
+private final class SideEffectCommandRunner: CommandRunning, @unchecked Sendable {
+    private let sideEffect: @Sendable () -> Void
+
+    init(sideEffect: @escaping @Sendable () -> Void) {
+        self.sideEffect = sideEffect
+    }
+
+    func run(
+        _ executable: String,
+        _ arguments: [String],
+        currentDirectory: URL?,
+        onOutputLine: (@Sendable (String) -> Void)?
+    ) async throws -> CommandResult {
+        sideEffect()
+        return CommandResult(exitCode: 0, stdout: "", stderr: "")
+    }
+}
+
+/// Refuses to delete anything, so a test can reach the branch where the store survives a removal
+/// attempt without depending on filesystem permissions.
+private final class UnremovableFileManager: FileManager, @unchecked Sendable {
+    override func removeItem(atPath path: String) throws {
+        throw CocoaError(.fileWriteNoPermission)
     }
 }
 

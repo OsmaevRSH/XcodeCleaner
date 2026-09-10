@@ -405,7 +405,9 @@ final class AppModel {
         cancelMeasuring()
         await work {
             for info in mounts {
-                try await mountManager.remove(info.mount) { [weak self] line in
+                // The store size is whatever the streamed scan already measured, so the removal
+                // never re-walks gigabytes just to report the space it freed.
+                try await mountManager.remove(info.mount, knownStoreSize: size(of: info)) { [weak self] line in
                     Task { @MainActor in self?.log(line) }
                 }
             }
