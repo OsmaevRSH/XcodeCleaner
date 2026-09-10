@@ -238,7 +238,8 @@ final class CleanerTests: XCTestCase {
                 ),
                 storeSizeBytes: nil,
                 isMain: true,
-                sharesMainObjectStore: true
+                sharesMainObjectStore: true,
+                lastUsedAt: nil
             ),
             ArcMountInfo(
                 mount: ArcMount(
@@ -249,7 +250,8 @@ final class CleanerTests: XCTestCase {
                 ),
                 storeSizeBytes: 10,
                 isMain: false,
-                sharesMainObjectStore: true
+                sharesMainObjectStore: true,
+                lastUsedAt: nil
             ),
         ]
 

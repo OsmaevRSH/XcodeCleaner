@@ -13,8 +13,8 @@ final class ProjectCachesTests: XCTestCase {
         let global = try temp.makeDirectory(".cache/tuist")
         let paths = CachePaths(home: temp.url)
         let mounts = [
-            ArcMountInfo(mount: ArcMount(status: .mounted, mount: mounted.path, store: "/s", objectStore: "/o"), storeSizeBytes: nil, isMain: true, sharesMainObjectStore: true),
-            ArcMountInfo(mount: ArcMount(status: .unmounted, mount: unmounted.path, store: "/s", objectStore: "/o"), storeSizeBytes: 0, isMain: false, sharesMainObjectStore: true),
+            ArcMountInfo(mount: ArcMount(status: .mounted, mount: mounted.path, store: "/s", objectStore: "/o"), storeSizeBytes: nil, isMain: true, sharesMainObjectStore: true, lastUsedAt: nil),
+            ArcMountInfo(mount: ArcMount(status: .unmounted, mount: unmounted.path, store: "/s", objectStore: "/o"), storeSizeBytes: 0, isMain: false, sharesMainObjectStore: true, lastUsedAt: nil),
         ]
 
         let items = ProjectCacheScanner.items(mounts: mounts, cachePaths: paths)

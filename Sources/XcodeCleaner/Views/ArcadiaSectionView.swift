@@ -7,13 +7,6 @@ struct ArcadiaSectionView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                TextField("Имя нового маунта, например SAFTIOS-1234", text: $model.newMountName)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { Task { await model.mountNew() } }
-                Button("Смонтировать") {
-                    Task { await model.mountNew() }
-                }
-                .disabled(model.newMountName.trimmingCharacters(in: .whitespaces).isEmpty || model.isWorking)
                 Spacer()
                 Button("Размонтировать выбранные") {
                     Task { await model.unmountSelected() }

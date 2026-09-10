@@ -36,35 +36,38 @@ public struct ArcMount: Sendable, Equatable, Identifiable, Decodable, Hashable {
 
 public struct ArcMountInfo: Sendable, Equatable, Identifiable, Hashable {
     public let mount: ArcMount
+    /// Nil until somebody measures it: `ArcMountManager.list()` leaves it empty on purpose.
     public let storeSizeBytes: Int64?
     public let isMain: Bool
     public let sharesMainObjectStore: Bool
+    public let lastUsedAt: Date?
 
-    public init(mount: ArcMount, storeSizeBytes: Int64?, isMain: Bool, sharesMainObjectStore: Bool) {
+    public init(
+        mount: ArcMount,
+        storeSizeBytes: Int64?,
+        isMain: Bool,
+        sharesMainObjectStore: Bool,
+        lastUsedAt: Date?
+    ) {
         self.mount = mount
         self.storeSizeBytes = storeSizeBytes
         self.isMain = isMain
         self.sharesMainObjectStore = sharesMainObjectStore
+        self.lastUsedAt = lastUsedAt
     }
 
     public var id: String { mount.id }
 }
 
 public enum ArcMountError: Error, Equatable, Sendable, LocalizedError {
-    case invalidName(String)
-    case directoryNotEmpty(String)
-    case mainMountNotFound
     case mainMountProtected
     case refusedPath(String)
     case commandFailed(String, String)
 
     public var errorDescription: String? {
         switch self {
-        case let .invalidName(name): "Недопустимое имя маунта: \"\(name)\""
-        case let .directoryNotEmpty(path): "Папка уже существует и не пуста: \(path)"
-        case .mainMountNotFound: "Основной маунт ~/arcadia не найден"
         case .mainMountProtected: "Основной маунт ~/arcadia удалить нельзя"
-        case let .refusedPath(path): "Небезопасный путь маунта, удаление отклонено: \(path)"
+        case let .refusedPath(path): "Небезопасный путь, удаление отклонено: \(path)"
         case let .commandFailed(command, stderr): "\(command) завершилась с ошибкой: \(stderr)"
         }
     }
@@ -86,6 +89,10 @@ public struct ArcMountManager: Sendable {
     }
 
     public var mainMountPath: String { home.appendingPathComponent("arcadia").path }
+
+    /// The only directory arc keeps per-mount stores in, and therefore the only directory this
+    /// manager ever deletes recursively.
+    public var storesRootPath: String { home.appendingPathComponent(".arc/stores").path }
 
     /// The spelling handed back to `arc` and `rmdir`: `arc` may report a mount with a trailing
     /// slash, a `.` component or a `~`, and all of those have to be resolved before the path is
@@ -136,8 +143,18 @@ public struct ArcMountManager: Sendable {
         }
     }
 
+    /// Arc rewrites `<store>/.arc` whenever the mount is actually used — a checkout or a commit
+    /// moves it — while the store root's own mtime stays at the moment the store was created. The
+    /// metadata directory is therefore the honest answer to "when was this mount last touched"; the
+    /// root is only a fallback for a store arc has not populated yet.
+    public static func lastUsed(ofStore store: String, fileManager: FileManager) -> Date? {
+        let root = URL(fileURLWithPath: store)
+        return modificationDate(of: root.appendingPathComponent(".arc").path, fileManager: fileManager)
+            ?? modificationDate(of: root.path, fileManager: fileManager)
+    }
+
     /// Sizing the per-mount stores walks tens of gigabytes, so each store is walked in its own
-    /// child task at utility priority and only for the mounts that can actually be forgotten; the
+    /// child task at utility priority and only for the mounts that can actually be removed; the
     /// main mount is skipped entirely. Child tasks — unlike detached ones — inherit cancellation,
     /// which is what lets `DirectorySizer` abandon a walk in progress.
     public func storeSizes(for mounts: [ArcMount]) async -> [String: Int64] {
@@ -164,96 +181,126 @@ public struct ArcMountManager: Sendable {
         }
     }
 
+    /// Size of one mount's store, measured synchronously. Returns nil for the main mount.
+    ///
+    /// The single-mount counterpart of `storeSizes(for:)`, so a caller can walk one store at a time
+    /// and show each number as it arrives instead of waiting for all of them.
+    public func storeSize(for mount: ArcMount) -> Int64? {
+        guard comparablePath(mount.mount) != comparablePath(mainMountPath) else { return nil }
+        // A private `FileManager`: the walk may run on any thread, and the injected instance is
+        // shared with everything else this manager does.
+        return DirectorySizer.size(of: URL(fileURLWithPath: mount.store), fileManager: FileManager())
+    }
+
+    /// Deliberately measures nothing: one `arc mount --list` plus one `stat` per store, so the list
+    /// appears at once. `storeSizeBytes` stays nil until a caller fills it in with `storeSize(for:)`
+    /// or `storeSizes(for:)`.
     public func list() async throws -> [ArcMountInfo] {
         let mounts = try await mounts()
-        let sizes = await storeSizes(for: mounts)
         let mainPath = comparablePath(mainMountPath)
         let main = mounts.first { comparablePath($0.mount) == mainPath }
         return mounts.map { mount in
-            let isMain = comparablePath(mount.mount) == mainPath
-            return ArcMountInfo(
+            ArcMountInfo(
                 mount: mount,
-                storeSizeBytes: isMain ? nil : sizes[mount.mount],
-                isMain: isMain,
-                sharesMainObjectStore: main.map { $0.objectStore == mount.objectStore } ?? false
+                storeSizeBytes: nil,
+                isMain: comparablePath(mount.mount) == mainPath,
+                sharesMainObjectStore: main.map { $0.objectStore == mount.objectStore } ?? false,
+                lastUsedAt: Self.lastUsed(ofStore: mount.store, fileManager: fileManager)
             )
         }
     }
 
-    /// The name is only ever a path *suffix* after the fixed `arcadia_` prefix, so a name starting
-    /// with `-` can never turn into an option when the path is passed to `arc mount -m`.
-    public func mountPath(forName name: String) throws -> URL {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let forbidden = CharacterSet(charactersIn: "/ \t\n").union(.controlCharacters)
-        guard trimmed.isEmpty == false,
-              trimmed != "..",
-              trimmed.rangeOfCharacter(from: forbidden) == nil
-        else {
-            throw ArcMountError.invalidName(name)
-        }
-        return home.appendingPathComponent("arcadia_\(trimmed)")
-    }
-
-    @discardableResult
-    public func mountNew(name: String, log: @escaping Log) async throws -> URL {
-        let path = try mountPath(forName: name)
-        let existedBefore = fileManager.fileExists(atPath: path.path)
-        if existedBefore {
-            let contents = try fileManager.contentsOfDirectory(atPath: path.path)
-            guard contents.isEmpty else {
-                throw ArcMountError.directoryNotEmpty(path.path)
-            }
-        }
-        let mounts = try await mounts()
-        let mainPath = comparablePath(mainMountPath)
-        guard let main = mounts.first(where: { comparablePath($0.mount) == mainPath }) else {
-            throw ArcMountError.mainMountNotFound
-        }
-        try fileManager.createDirectory(at: path, withIntermediateDirectories: true)
-        if existedBefore == false {
-            log("mkdir -p \(path.path)")
-        }
-        let arguments = ["mount", "-m", path.path, "--object-store", main.objectStore, "--override-object-store"]
-        log("arc \(arguments.joined(separator: " "))")
-        let result = try await runner.run("arc", arguments, currentDirectory: home, onOutputLine: log)
-        guard result.succeeded else {
-            // A directory that was already there is the user's, not ours to clean up.
-            if existedBefore == false {
-                removeEmptyMountDirectory(path.path, log: log)
-            }
-            throw ArcMountError.commandFailed("arc mount", result.stderr)
-        }
-        return path
-    }
-
     public func unmount(_ mountPath: String, force: Bool, log: @escaping Log) async throws {
         try refuseUnsafePath(mountPath)
-        var arguments = ["unmount"]
-        if force { arguments.append("--force") }
-        arguments.append(normalizedPath(mountPath))
-        log("arc \(arguments.joined(separator: " "))")
-        let result = try await runner.run("arc", arguments, currentDirectory: home, onOutputLine: log)
+        let result = try await runUnmount(normalizedPath(mountPath), force: force, log: log)
         guard result.succeeded else {
             throw ArcMountError.commandFailed("arc unmount", result.stderr)
         }
     }
 
-    public func forget(_ mount: ArcMount, log: @escaping Log) async throws {
+    /// Removes everything the mount owns: the live FUSE mount, arc's registry entry, the per-mount
+    /// store and the empty mount directory.
+    ///
+    /// `arc` is best-effort here. It exits 1 for a repository that is already unmounted and again
+    /// for a path it no longer recognises, and neither answer means the user's intent — "delete
+    /// this mount and everything behind it" — is out of reach: the store is still there to delete.
+    /// Only a run that neither convinced `arc` nor freed the store is reported as a failure.
+    public func remove(_ mount: ArcMount, log: @escaping Log) async throws {
         guard comparablePath(mount.mount) != comparablePath(mainMountPath) else {
             throw ArcMountError.mainMountProtected
         }
         try refuseUnsafePath(mount.mount)
         let path = normalizedPath(mount.mount)
+
         if mount.isMounted {
-            try await unmount(path, force: false, log: log)
+            let result = try await runUnmount(path, force: false, log: log)
+            if result.succeeded == false {
+                guard Self.output(of: result).lowercased().contains("already unmounted") else {
+                    throw ArcMountError.commandFailed("arc unmount", result.stderr)
+                }
+                log("Маунт \(path) уже размонтирован, продолжаем")
+            }
         }
+
         let arguments = ["unmount", "--forget", path]
         log("arc \(arguments.joined(separator: " "))")
-        let result = try await runner.run("arc", arguments, currentDirectory: home, onOutputLine: log)
-        guard result.succeeded else {
-            throw ArcMountError.commandFailed("arc unmount --forget", result.stderr)
+        let forgetResult = try await runner.run("arc", arguments, currentDirectory: home, onOutputLine: log)
+        if forgetResult.succeeded == false {
+            log("arc не забыла маунт \(path), удаляем стор сами")
         }
+
+        let storeRemoved = try removeStore(mount.store, log: log)
         removeEmptyMountDirectory(path, log: log)
+
+        if forgetResult.succeeded == false, storeRemoved == false {
+            throw ArcMountError.commandFailed("arc unmount --forget", Self.output(of: forgetResult))
+        }
+    }
+
+    private func runUnmount(_ path: String, force: Bool, log: @escaping Log) async throws -> CommandResult {
+        var arguments = ["unmount"]
+        if force { arguments.append("--force") }
+        arguments.append(path)
+        log("arc \(arguments.joined(separator: " "))")
+        return try await runner.run("arc", arguments, currentDirectory: home, onOutputLine: log)
+    }
+
+    /// The fallback for a store that `arc unmount --forget` left behind: it is gigabytes of this
+    /// mount's own objects and the user asked for it to go. Confined to `~/.arc/stores/`, the only
+    /// place arc keeps per-mount stores, so a mangled `store` field can never aim the recursive
+    /// delete at the user's own files. The main mount never gets here — `remove(_:log:)` refuses it
+    /// before anything runs.
+    ///
+    /// - Returns: whether the store directory is gone because of this call.
+    private func removeStore(_ store: String, log: Log) throws -> Bool {
+        let path = normalizedPath(store)
+        guard fileManager.fileExists(atPath: path) else { return false }
+        guard isStrictlyInside(path, of: storesRootPath) else {
+            log("Стор \(path) лежит вне \(storesRootPath), удаление отклонено")
+            throw ArcMountError.refusedPath(store)
+        }
+        let freed = DirectorySizer.size(of: URL(fileURLWithPath: path), fileManager: FileManager())
+        do {
+            try fileManager.removeItem(atPath: path)
+            log("Удалена папка стора \(path), освобождено \(ByteFormatting.string(freed))")
+            return true
+        } catch {
+            log("Не удалось удалить папку стора \(path): \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// `arc` puts its diagnostics on either stream depending on the subcommand, so both are read
+    /// when a failure is classified and when it is reported back.
+    private static func output(of result: CommandResult) -> String {
+        [result.stdout, result.stderr]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.isEmpty == false }
+            .joined(separator: "\n")
+    }
+
+    private static func modificationDate(of path: String, fileManager: FileManager) -> Date? {
+        (try? fileManager.attributesOfItem(atPath: path))?[.modificationDate] as? Date
     }
 
     /// `--forget` deletes the mount's store and `unmount` tears down a live FUSE mount, so a
@@ -261,13 +308,16 @@ public struct ArcMountManager: Sendable {
     /// below the home directory are accepted. The original spelling is reported back so the user
     /// sees the path they were shown.
     private func refuseUnsafePath(_ path: String) throws {
-        let homeComponents = URL(fileURLWithPath: comparablePath(home.path)).pathComponents
-        let pathComponents = URL(fileURLWithPath: comparablePath(path)).pathComponents
-        guard pathComponents.count > homeComponents.count,
-              Array(pathComponents.prefix(homeComponents.count)) == homeComponents
-        else {
+        guard isStrictlyInside(path, of: home.path) else {
             throw ArcMountError.refusedPath(path)
         }
+    }
+
+    private func isStrictlyInside(_ path: String, of root: String) -> Bool {
+        let rootComponents = URL(fileURLWithPath: comparablePath(root)).pathComponents
+        let pathComponents = URL(fileURLWithPath: comparablePath(path)).pathComponents
+        return pathComponents.count > rootComponents.count
+            && Array(pathComponents.prefix(rootComponents.count)) == rootComponents
     }
 
     /// `rmdir(2)` removes the directory only when it is empty, so there is no window between

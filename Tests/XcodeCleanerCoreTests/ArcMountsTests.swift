@@ -15,6 +15,10 @@ final class ArcMountsTests: XCTestCase {
         return ArcMountManager(runner: runner, home: home)
     }
 
+    private func exists(_ url: URL) -> Bool {
+        FileManager.default.fileExists(atPath: url.path)
+    }
+
     func test_parsesList() throws {
         let mounts = try ArcMount.parse(Data(listJSON.utf8))
 
@@ -37,56 +41,10 @@ final class ArcMountsTests: XCTestCase {
             "/Users/tester/arcadia_SAFTIOS-2",
         ])
         XCTAssertTrue(infos[0].isMain)
-        XCTAssertNil(infos[0].storeSizeBytes)
+        XCTAssertTrue(infos.allSatisfy { $0.storeSizeBytes == nil })
         XCTAssertTrue(infos[1].sharesMainObjectStore)
         XCTAssertFalse(infos[2].sharesMainObjectStore)
         XCTAssertEqual(runner.calls[0].currentDirectory, "/Users/tester")
-    }
-
-    func test_mountPathValidation() throws {
-        let manager = ArcMountManager(runner: FakeCommandRunner(), home: URL(fileURLWithPath: "/Users/tester"))
-
-        XCTAssertEqual(try manager.mountPath(forName: "SAFTIOS-1").path, "/Users/tester/arcadia_SAFTIOS-1")
-        XCTAssertThrowsError(try manager.mountPath(forName: ""))
-        XCTAssertThrowsError(try manager.mountPath(forName: "a/b"))
-        XCTAssertThrowsError(try manager.mountPath(forName: "a b"))
-        XCTAssertThrowsError(try manager.mountPath(forName: ".."))
-    }
-
-    func test_mountNewRunsArcMountWithMainObjectStore() async throws {
-        let temp = try TemporaryDirectory()
-        defer { temp.remove() }
-        let runner = FakeCommandRunner()
-        let mainMount = temp.url.appendingPathComponent("arcadia").path
-        runner.respond(
-            to: "arc mount --list --json",
-            stdout: """
-            [{"status":"mounted","mount":"\(mainMount)","store":"/store","object-store":"/store/.arc/objects"}]
-            """
-        )
-        let manager = ArcMountManager(runner: runner, home: temp.url)
-
-        let path = try await manager.mountNew(name: "SAFTIOS-9") { _ in }
-
-        XCTAssertEqual(path.path, temp.url.appendingPathComponent("arcadia_SAFTIOS-9").path)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: path.path))
-        XCTAssertEqual(runner.callLines.last, "arc mount -m \(path.path) --object-store /store/.arc/objects --override-object-store")
-    }
-
-    func test_mountNewRefusesNonEmptyDirectory() async throws {
-        let temp = try TemporaryDirectory()
-        defer { temp.remove() }
-        try temp.makeFile("arcadia_busy/file", bytes: 1)
-        let runner = FakeCommandRunner()
-        let manager = makeManager(runner, home: temp.url)
-
-        do {
-            _ = try await manager.mountNew(name: "busy") { _ in }
-            XCTFail("expected throw")
-        } catch let error as ArcMountError {
-            XCTAssertEqual(error, .directoryNotEmpty(temp.url.appendingPathComponent("arcadia_busy").path))
-        }
-        XCTAssertFalse(runner.callLines.contains { $0.hasPrefix("arc mount -m") })
     }
 
     func test_unmountWithAndWithoutForce() async throws {
@@ -117,7 +75,7 @@ final class ArcMountsTests: XCTestCase {
         }
     }
 
-    func test_forgetUnmountsIfMountedThenForgetsAndRemovesEmptyDir() async throws {
+    func test_removeUnmountsIfMountedThenForgetsAndRemovesEmptyDir() async throws {
         let temp = try TemporaryDirectory()
         defer { temp.remove() }
         let mountDir = try temp.makeDirectory("arcadia_SAFTIOS-2")
@@ -125,16 +83,162 @@ final class ArcMountsTests: XCTestCase {
         let manager = ArcMountManager(runner: runner, home: temp.url)
         let mount = ArcMount(status: .mounted, mount: mountDir.path, store: "/s", objectStore: "/o")
 
-        try await manager.forget(mount) { _ in }
+        try await manager.remove(mount) { _ in }
 
         XCTAssertEqual(runner.callLines, [
             "arc unmount \(mountDir.path)",
             "arc unmount --forget \(mountDir.path)",
         ])
-        XCTAssertFalse(FileManager.default.fileExists(atPath: mountDir.path))
+        XCTAssertFalse(exists(mountDir))
     }
 
-    func test_forgetKeepsNonEmptyDirectory() async throws {
+    func test_removeSkipsUnmountForAnUnmountedMount() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let mountDir = try temp.makeDirectory("arcadia_SAFTIOS-4")
+        let store = try temp.makeDirectory(".arc/stores/_arcadia_SAFTIOS-4")
+        let runner = FakeCommandRunner()
+        let manager = ArcMountManager(runner: runner, home: temp.url)
+        let mount = ArcMount(status: .unmounted, mount: mountDir.path, store: store.path, objectStore: "/o")
+
+        try await manager.remove(mount) { _ in }
+
+        XCTAssertEqual(runner.callLines, ["arc unmount --forget \(mountDir.path)"])
+        XCTAssertFalse(exists(store))
+        XCTAssertFalse(exists(mountDir))
+    }
+
+    func test_removeContinuesWhenArcReportsAlreadyUnmounted() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let mountDir = try temp.makeDirectory("arcadia_SAFTIOS-5")
+        let store = try temp.makeDirectory(".arc/stores/_arcadia_SAFTIOS-5")
+        try temp.makeFile(".arc/stores/_arcadia_SAFTIOS-5/blob.bin", bytes: 4096)
+        let runner = FakeCommandRunner()
+        runner.respond(
+            to: "arc unmount \(mountDir.path)",
+            stderr: "Repository seems to be already unmounted",
+            exitCode: 1
+        )
+        let manager = ArcMountManager(runner: runner, home: temp.url)
+        let mount = ArcMount(status: .mounted, mount: mountDir.path, store: store.path, objectStore: "/o")
+        let logged = LineCollector()
+
+        try await manager.remove(mount) { logged.append($0) }
+
+        XCTAssertEqual(runner.callLines, [
+            "arc unmount \(mountDir.path)",
+            "arc unmount --forget \(mountDir.path)",
+        ])
+        XCTAssertFalse(exists(store))
+        XCTAssertFalse(exists(mountDir))
+        XCTAssertTrue(logged.contains("уже размонтирован"))
+    }
+
+    func test_removeThrowsWhenUnmountFailsForAnotherReason() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let mountDir = try temp.makeDirectory("arcadia_SAFTIOS-3")
+        let store = try temp.makeDirectory(".arc/stores/_arcadia_SAFTIOS-3")
+        let runner = FakeCommandRunner()
+        runner.respond(to: "arc unmount \(mountDir.path)", stderr: "busy", exitCode: 1)
+        let manager = ArcMountManager(runner: runner, home: temp.url)
+        let mount = ArcMount(status: .mounted, mount: mountDir.path, store: store.path, objectStore: "/o")
+
+        do {
+            try await manager.remove(mount) { _ in }
+            XCTFail("expected throw")
+        } catch let error as ArcMountError {
+            XCTAssertEqual(error, .commandFailed("arc unmount", "busy"))
+        } catch {
+            XCTFail("unexpected \(error)")
+        }
+        XCTAssertEqual(runner.callLines, ["arc unmount \(mountDir.path)"])
+        XCTAssertTrue(exists(mountDir))
+        XCTAssertTrue(exists(store))
+    }
+
+    func test_removeDeletesStoreItselfWhenForgetFails() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let mountDir = try temp.makeDirectory("arcadia_SAFTIOS-6")
+        let store = try temp.makeDirectory(".arc/stores/_arcadia_SAFTIOS-6")
+        try temp.makeFile(".arc/stores/_arcadia_SAFTIOS-6/blob.bin", bytes: 4096)
+        let runner = FakeCommandRunner()
+        runner.respond(
+            to: "arc unmount --forget \(mountDir.path)",
+            stdout: "Not an arc repository. Are you sure that you are unmounting correct path: '\(mountDir.path)' ?",
+            exitCode: 1
+        )
+        let manager = ArcMountManager(runner: runner, home: temp.url)
+        let mount = ArcMount(status: .unmounted, mount: mountDir.path, store: store.path, objectStore: "/o")
+        let logged = LineCollector()
+
+        try await manager.remove(mount) { logged.append($0) }
+
+        XCTAssertFalse(exists(store))
+        XCTAssertFalse(exists(mountDir))
+        XCTAssertTrue(logged.contains("Not an arc repository."))
+        XCTAssertTrue(logged.contains(store.path))
+    }
+
+    func test_removeThrowsWhenForgetFailsAndStoreIsMissing() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let mountDir = try temp.makeDirectory("arcadia_SAFTIOS-7")
+        let store = temp.url.appendingPathComponent(".arc/stores/_arcadia_SAFTIOS-7")
+        let runner = FakeCommandRunner()
+        runner.respond(
+            to: "arc unmount --forget \(mountDir.path)",
+            stdout: "Not an arc repository.",
+            exitCode: 1
+        )
+        let manager = ArcMountManager(runner: runner, home: temp.url)
+        let mount = ArcMount(status: .unmounted, mount: mountDir.path, store: store.path, objectStore: "/o")
+
+        do {
+            try await manager.remove(mount) { _ in }
+            XCTFail("expected throw")
+        } catch let error as ArcMountError {
+            XCTAssertEqual(error, .commandFailed("arc unmount --forget", "Not an arc repository."))
+        } catch {
+            XCTFail("unexpected \(error)")
+        }
+    }
+
+    func test_removeRefusesStoreOutsideArcStores() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let outside = try TemporaryDirectory()
+        defer { outside.remove() }
+        let mountDir = try temp.makeDirectory("arcadia_SAFTIOS-8")
+        let store = try outside.makeDirectory("evil")
+        try outside.makeFile("evil/precious.bin", bytes: 512)
+        let runner = FakeCommandRunner()
+        runner.respond(
+            to: "arc unmount --forget \(mountDir.path)",
+            stdout: "Not an arc repository.",
+            exitCode: 1
+        )
+        let manager = ArcMountManager(runner: runner, home: temp.url)
+        let mount = ArcMount(status: .unmounted, mount: mountDir.path, store: store.path, objectStore: "/o")
+        let logged = LineCollector()
+
+        do {
+            try await manager.remove(mount) { logged.append($0) }
+            XCTFail("expected throw")
+        } catch let error as ArcMountError {
+            XCTAssertEqual(error, .refusedPath(store.path))
+        } catch {
+            XCTFail("unexpected \(error)")
+        }
+        XCTAssertTrue(exists(store))
+        XCTAssertTrue(exists(store.appendingPathComponent("precious.bin")))
+        XCTAssertTrue(exists(mountDir))
+        XCTAssertTrue(logged.contains("Not an arc repository."))
+    }
+
+    func test_removeKeepsNonEmptyDirectory() async throws {
         let temp = try TemporaryDirectory()
         defer { temp.remove() }
         let mountDir = try temp.makeDirectory("arcadia_SAFTIOS-1")
@@ -144,20 +248,20 @@ final class ArcMountsTests: XCTestCase {
         let mount = ArcMount(status: .unmounted, mount: mountDir.path, store: "/s", objectStore: "/o")
         let logged = LineCollector()
 
-        try await manager.forget(mount) { logged.append($0) }
+        try await manager.remove(mount) { logged.append($0) }
 
         XCTAssertEqual(runner.callLines, ["arc unmount --forget \(mountDir.path)"])
-        XCTAssertTrue(FileManager.default.fileExists(atPath: mountDir.path))
+        XCTAssertTrue(exists(mountDir))
         XCTAssertTrue(logged.contains("не пуста"))
     }
 
-    func test_forgetRefusesMainMount() async {
+    func test_removeRefusesMainMount() async {
         let runner = FakeCommandRunner()
         let manager = ArcMountManager(runner: runner, home: URL(fileURLWithPath: "/Users/tester"))
         let main = ArcMount(status: .mounted, mount: "/Users/tester/arcadia", store: "/s", objectStore: "/o")
 
         do {
-            try await manager.forget(main) { _ in }
+            try await manager.remove(main) { _ in }
             XCTFail("expected throw")
         } catch let error as ArcMountError {
             XCTAssertEqual(error, .mainMountProtected)
@@ -186,7 +290,7 @@ final class ArcMountsTests: XCTestCase {
         XCTAssertEqual(manager.normalizedPath("~/arcadia_X"), "/Users/tester/arcadia_X")
     }
 
-    func test_forgetRefusesMainMountSpelledDifferently() async {
+    func test_removeRefusesMainMountSpelledDifferently() async {
         let spellings = [
             "/Users/tester/arcadia/",
             "/Users/tester/./arcadia",
@@ -198,7 +302,7 @@ final class ArcMountsTests: XCTestCase {
             let mount = ArcMount(status: .mounted, mount: spelling, store: "/s", objectStore: "/o")
 
             do {
-                try await manager.forget(mount) { _ in }
+                try await manager.remove(mount) { _ in }
                 XCTFail("expected throw for \(spelling)")
             } catch let error as ArcMountError {
                 XCTAssertEqual(error, .mainMountProtected, "spelling \(spelling)")
@@ -209,13 +313,13 @@ final class ArcMountsTests: XCTestCase {
         }
     }
 
-    func test_forgetRefusesTildeSpelledMainMount() async {
+    func test_removeRefusesTildeSpelledMainMount() async {
         let runner = FakeCommandRunner()
         let manager = ArcMountManager(runner: runner, home: URL(fileURLWithPath: "/Users/tester"))
         let mount = ArcMount(status: .mounted, mount: "~/arcadia", store: "/s", objectStore: "/o")
 
         do {
-            try await manager.forget(mount) { _ in }
+            try await manager.remove(mount) { _ in }
             XCTFail("expected throw")
         } catch let error as ArcMountError {
             XCTAssertEqual(error, .mainMountProtected)
@@ -225,14 +329,14 @@ final class ArcMountsTests: XCTestCase {
         XCTAssertTrue(runner.callLines.isEmpty)
     }
 
-    func test_forgetRefusesPathsNotInsideHome() async {
+    func test_removeRefusesPathsNotInsideHome() async {
         for path in ["/", "/Users", "/Users/tester", "/Users/other/arcadia_x"] {
             let runner = FakeCommandRunner()
             let manager = ArcMountManager(runner: runner, home: URL(fileURLWithPath: "/Users/tester"))
             let mount = ArcMount(status: .mounted, mount: path, store: "/s", objectStore: "/o")
 
             do {
-                try await manager.forget(mount) { _ in }
+                try await manager.remove(mount) { _ in }
                 XCTFail("expected throw for \(path)")
             } catch let error as ArcMountError {
                 XCTAssertEqual(error, .refusedPath(path), "path \(path)")
@@ -243,25 +347,31 @@ final class ArcMountsTests: XCTestCase {
         }
     }
 
-    func test_forgetAbortsWhenUnmountFails() async throws {
-        let temp = try TemporaryDirectory()
-        defer { temp.remove() }
-        let mountDir = try temp.makeDirectory("arcadia_SAFTIOS-3")
+    func test_removeNormalizesTrailingSlashBeforePassingPathToArc() async throws {
         let runner = FakeCommandRunner()
-        runner.respond(to: "arc unmount \(mountDir.path)", stderr: "busy", exitCode: 1)
-        let manager = ArcMountManager(runner: runner, home: temp.url)
-        let mount = ArcMount(status: .mounted, mount: mountDir.path, store: "/s", objectStore: "/o")
+        let manager = ArcMountManager(runner: runner, home: URL(fileURLWithPath: "/Users/tester"))
+        let mount = ArcMount(status: .unmounted, mount: "/Users/tester/arcadia_X/", store: "/s", objectStore: "/o")
 
-        do {
-            try await manager.forget(mount) { _ in }
-            XCTFail("expected throw")
-        } catch let error as ArcMountError {
-            XCTAssertEqual(error, .commandFailed("arc unmount", "busy"))
-        } catch {
-            XCTFail("unexpected \(error)")
+        try await manager.remove(mount) { _ in }
+
+        XCTAssertEqual(runner.callLines, ["arc unmount --forget /Users/tester/arcadia_X"])
+    }
+
+    func test_unmountRefusesPathsNotInsideHome() async {
+        for path in ["/", "/Users", "/Users/tester", "/Users/other/arcadia_x"] {
+            let runner = FakeCommandRunner()
+            let manager = ArcMountManager(runner: runner, home: URL(fileURLWithPath: "/Users/tester"))
+
+            do {
+                try await manager.unmount(path, force: false) { _ in }
+                XCTFail("expected throw for \(path)")
+            } catch let error as ArcMountError {
+                XCTAssertEqual(error, .refusedPath(path), "path \(path)")
+            } catch {
+                XCTFail("unexpected \(error)")
+            }
+            XCTAssertTrue(runner.callLines.isEmpty, "path \(path)")
         }
-        XCTAssertEqual(runner.callLines, ["arc unmount \(mountDir.path)"])
-        XCTAssertTrue(FileManager.default.fileExists(atPath: mountDir.path))
     }
 
     func test_listMarksMainMountSpelledWithTrailingSlash() async throws {
@@ -363,149 +473,127 @@ final class ArcMountsTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(sizes[other.mount] ?? 0, 4096)
     }
 
-    func test_mountNewDoesNotSizeStores() async throws {
+    func test_storeSizeMeasuresOneStoreAndSkipsMainMount() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let store = try temp.makeDirectory("store-a")
+        try temp.makeFile("store-a/blob.bin", bytes: 4096)
+        let manager = ArcMountManager(runner: FakeCommandRunner(), home: temp.url)
+        let main = ArcMount(
+            status: .mounted,
+            mount: temp.url.appendingPathComponent("arcadia").path,
+            store: store.path,
+            objectStore: "/o"
+        )
+        let other = ArcMount(
+            status: .mounted,
+            mount: temp.url.appendingPathComponent("arcadia_SAFTIOS-1").path,
+            store: store.path,
+            objectStore: "/o"
+        )
+
+        XCTAssertNil(manager.storeSize(for: main))
+        XCTAssertGreaterThanOrEqual(manager.storeSize(for: other) ?? 0, 4096)
+    }
+
+    func test_listDoesNotMeasureStoreSizes() async throws {
         let temp = try TemporaryDirectory()
         defer { temp.remove() }
         let runner = FakeCommandRunner()
         let mainMount = temp.url.appendingPathComponent("arcadia").path
-        let storePath = temp.url.appendingPathComponent("missing-store").path
+        let otherMount = temp.url.appendingPathComponent("arcadia_SAFTIOS-1").path
+        let store = try temp.makeDirectory(".arc/stores/_arcadia_SAFTIOS-1")
+        try temp.makeFile(".arc/stores/_arcadia_SAFTIOS-1/blob.bin", bytes: 4096)
         runner.respond(
             to: "arc mount --list --json",
             stdout: """
-            [{"status":"mounted","mount":"\(mainMount)","store":"\(storePath)","object-store":"/store/.arc/objects"}]
+            [
+              {"status":"mounted","mount":"\(mainMount)","store":"/store","object-store":"/o"},
+              {"status":"mounted","mount":"\(otherMount)","store":"\(store.path)","object-store":"/o"}
+            ]
             """
         )
         let fileManager = RecordingFileManager()
         let manager = ArcMountManager(runner: runner, home: temp.url, fileManager: fileManager)
 
-        let path = try await manager.mountNew(name: "SAFTIOS-9") { _ in }
+        let infos = try await manager.list()
 
-        XCTAssertEqual(runner.callLines, [
-            "arc mount --list --json",
-            "arc mount -m \(path.path) --object-store /store/.arc/objects --override-object-store",
-        ])
-        XCTAssertFalse(fileManager.inspectedPaths.contains(storePath))
+        XCTAssertEqual(runner.callLines, ["arc mount --list --json"])
+        XCTAssertTrue(infos.allSatisfy { $0.storeSizeBytes == nil })
+        XCTAssertFalse(fileManager.inspectedPaths.contains(store.path))
     }
 
-    func test_mountNewRemovesDirectoryWhenArcMountFails() async throws {
+    func test_lastUsedPrefersArcMetadataDirectory() throws {
         let temp = try TemporaryDirectory()
         defer { temp.remove() }
+        let store = try temp.makeDirectory("store")
+        let metadata = try temp.makeDirectory("store/.arc")
+        let expected = Date(timeIntervalSince1970: 1_700_000_000)
+        try FileManager.default.setAttributes([.modificationDate: expected], ofItemAtPath: metadata.path)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 1_000_000)],
+            ofItemAtPath: store.path
+        )
+
+        let date = ArcMountManager.lastUsed(ofStore: store.path, fileManager: .default)
+
+        XCTAssertEqual(date?.timeIntervalSince1970 ?? 0, expected.timeIntervalSince1970, accuracy: 1)
+    }
+
+    func test_lastUsedFallsBackToStoreRootWhenMetadataIsMissing() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let store = try temp.makeDirectory("store")
+        let expected = Date(timeIntervalSince1970: 1_600_000_000)
+        try FileManager.default.setAttributes([.modificationDate: expected], ofItemAtPath: store.path)
+
+        let date = ArcMountManager.lastUsed(ofStore: store.path, fileManager: .default)
+
+        XCTAssertEqual(date?.timeIntervalSince1970 ?? 0, expected.timeIntervalSince1970, accuracy: 1)
+    }
+
+    func test_lastUsedIsNilWhenStoreIsMissing() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+
+        let date = ArcMountManager.lastUsed(
+            ofStore: temp.url.appendingPathComponent("gone").path,
+            fileManager: .default
+        )
+
+        XCTAssertNil(date)
+    }
+
+    func test_listReadsLastUsedFromStoreMetadata() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let store = try temp.makeDirectory(".arc/stores/_arcadia_SAFTIOS-1")
+        let metadata = try temp.makeDirectory(".arc/stores/_arcadia_SAFTIOS-1/.arc")
+        let expected = Date(timeIntervalSince1970: 1_700_000_000)
+        try FileManager.default.setAttributes([.modificationDate: expected], ofItemAtPath: metadata.path)
         let runner = FakeCommandRunner()
-        let mainMount = temp.url.appendingPathComponent("arcadia").path
+        let used = temp.url.appendingPathComponent("arcadia_SAFTIOS-1").path
+        let missing = temp.url.appendingPathComponent("arcadia_SAFTIOS-2").path
         runner.respond(
             to: "arc mount --list --json",
             stdout: """
-            [{"status":"mounted","mount":"\(mainMount)","store":"/store","object-store":"/store/.arc/objects"}]
-            """
-        )
-        let newMount = temp.url.appendingPathComponent("arcadia_SAFTIOS-8").path
-        runner.respond(
-            to: "arc mount -m \(newMount) --object-store /store/.arc/objects --override-object-store",
-            stderr: "boom",
-            exitCode: 1
-        )
-        let manager = ArcMountManager(runner: runner, home: temp.url)
-        let logged = LineCollector()
-
-        do {
-            _ = try await manager.mountNew(name: "SAFTIOS-8") { logged.append($0) }
-            XCTFail("expected throw")
-        } catch let error as ArcMountError {
-            XCTAssertEqual(error, .commandFailed("arc mount", "boom"))
-        } catch {
-            XCTFail("unexpected \(error)")
-        }
-        XCTAssertFalse(FileManager.default.fileExists(atPath: newMount))
-        XCTAssertTrue(logged.contains("rmdir \(newMount)"))
-    }
-
-    func test_mountNewPassesLeadingDashNameAsPathSuffix() async throws {
-        let temp = try TemporaryDirectory()
-        defer { temp.remove() }
-        let runner = FakeCommandRunner()
-        let mainMount = temp.url.appendingPathComponent("arcadia").path
-        runner.respond(
-            to: "arc mount --list --json",
-            stdout: """
-            [{"status":"mounted","mount":"\(mainMount)","store":"/store","object-store":"/store/.arc/objects"}]
+            [
+              {"status":"mounted","mount":"\(used)","store":"\(store.path)","object-store":"/o"},
+              {"status":"mounted","mount":"\(missing)","store":"\(temp.url.appendingPathComponent("gone").path)","object-store":"/o"}
+            ]
             """
         )
         let manager = ArcMountManager(runner: runner, home: temp.url)
 
-        let path = try await manager.mountNew(name: "-rf") { _ in }
+        let infos = try await manager.list()
 
-        XCTAssertEqual(path.path, temp.url.appendingPathComponent("arcadia_-rf").path)
+        XCTAssertEqual(infos.count, 2)
         XCTAssertEqual(
-            runner.callLines.last,
-            "arc mount -m \(temp.url.appendingPathComponent("arcadia_-rf").path) --object-store /store/.arc/objects --override-object-store"
+            infos[0].lastUsedAt?.timeIntervalSince1970 ?? 0,
+            expected.timeIntervalSince1970,
+            accuracy: 1
         )
-    }
-
-    func test_forgetNormalizesTrailingSlashBeforePassingPathToArc() async throws {
-        let runner = FakeCommandRunner()
-        let manager = ArcMountManager(runner: runner, home: URL(fileURLWithPath: "/Users/tester"))
-        let mount = ArcMount(status: .unmounted, mount: "/Users/tester/arcadia_X/", store: "/s", objectStore: "/o")
-
-        try await manager.forget(mount) { _ in }
-
-        XCTAssertEqual(runner.callLines, ["arc unmount --forget /Users/tester/arcadia_X"])
-    }
-
-    func test_unmountRefusesPathsNotInsideHome() async {
-        for path in ["/", "/Users", "/Users/tester", "/Users/other/arcadia_x"] {
-            let runner = FakeCommandRunner()
-            let manager = ArcMountManager(runner: runner, home: URL(fileURLWithPath: "/Users/tester"))
-
-            do {
-                try await manager.unmount(path, force: false) { _ in }
-                XCTFail("expected throw for \(path)")
-            } catch let error as ArcMountError {
-                XCTAssertEqual(error, .refusedPath(path), "path \(path)")
-            } catch {
-                XCTFail("unexpected \(error)")
-            }
-            XCTAssertTrue(runner.callLines.isEmpty, "path \(path)")
-        }
-    }
-
-    func test_mountNewKeepsPreexistingEmptyDirectoryWhenArcMountFails() async throws {
-        let temp = try TemporaryDirectory()
-        defer { temp.remove() }
-        let existing = try temp.makeDirectory("arcadia_SAFTIOS-7")
-        let runner = FakeCommandRunner()
-        let mainMount = temp.url.appendingPathComponent("arcadia").path
-        runner.respond(
-            to: "arc mount --list --json",
-            stdout: """
-            [{"status":"mounted","mount":"\(mainMount)","store":"/store","object-store":"/store/.arc/objects"}]
-            """
-        )
-        runner.respond(
-            to: "arc mount -m \(existing.path) --object-store /store/.arc/objects --override-object-store",
-            stderr: "boom",
-            exitCode: 1
-        )
-        let manager = ArcMountManager(runner: runner, home: temp.url)
-        let logged = LineCollector()
-
-        do {
-            _ = try await manager.mountNew(name: "SAFTIOS-7") { logged.append($0) }
-            XCTFail("expected throw")
-        } catch let error as ArcMountError {
-            XCTAssertEqual(error, .commandFailed("arc mount", "boom"))
-        } catch {
-            XCTFail("unexpected \(error)")
-        }
-        XCTAssertTrue(FileManager.default.fileExists(atPath: existing.path))
-        XCTAssertFalse(logged.contains("rmdir"))
-    }
-
-    func test_mountPathRejectsControlCharacters() {
-        let manager = ArcMountManager(runner: FakeCommandRunner(), home: URL(fileURLWithPath: "/Users/tester"))
-
-        XCTAssertThrowsError(try manager.mountPath(forName: "SAFTIOS\u{0}-1"))
-        XCTAssertThrowsError(try manager.mountPath(forName: "SAFTIOS\u{7}-1"))
-        XCTAssertThrowsError(try manager.mountPath(forName: "SAFTIOS\u{1b}-1"))
+        XCTAssertNil(infos[1].lastUsedAt)
     }
 }
 

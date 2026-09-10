@@ -64,7 +64,6 @@ final class AppModel {
     var simulatorMode: SimulatorMode = .deleteUnavailable
     var archiveMaxAgeDays = 30
     var selectedMountIDs: Set<String> = []
-    var newMountName = ""
     var logLines: [String] = []
     var lastReport: CleanupReport?
     var errorMessage: String?
@@ -195,18 +194,6 @@ final class AppModel {
 
     // MARK: Arcadia
 
-    func mountNew() async {
-        let name = newMountName
-        await work {
-            let path = try await mountManager.mountNew(name: name) { [weak self] line in
-                Task { @MainActor in self?.log(line) }
-            }
-            log("Смонтировано: \(path.path)")
-            newMountName = ""
-        }
-        await rescan()
-    }
-
     func unmountSelected(force: Bool = false) async {
         let mounts = selectedMounts.filter { $0.mount.isMounted }
         unmountRetryPath = nil
@@ -256,7 +243,7 @@ final class AppModel {
         pendingConfirmation = nil
         await work {
             for info in mounts {
-                try await mountManager.forget(info.mount) { [weak self] line in
+                try await mountManager.remove(info.mount) { [weak self] line in
                     Task { @MainActor in self?.log(line) }
                 }
             }
