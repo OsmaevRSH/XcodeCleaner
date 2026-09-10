@@ -32,13 +32,7 @@ struct XcodeSectionView: View {
             }
         }
         .listStyle(.inset)
-        .overlay {
-            if model.isScanning {
-                ProgressView("Сканирование…")
-                    .padding()
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-            }
-        }
+        .scanningOverlay(model.isScanning)
     }
 
     private func category(_ kind: CleanupKind) -> some View {
@@ -131,7 +125,8 @@ struct XcodeSectionView: View {
                 step: 5
             )
             .padding(.leading, 24)
-        default:
+        case .xcodeCaches, .previews, .deviceSupport, .simulatorCaches, .xcodeApps, .toolchains,
+             .projectCaches:
             EmptyView()
         }
     }
@@ -162,7 +157,8 @@ struct XcodeSectionView: View {
         switch kind {
         case .archives:
             "\(kind.title) старше \(RussianPlural.daysAfterOlderThan(model.archiveMaxAgeDays))"
-        default:
+        case .xcodeCaches, .previews, .deviceSupport, .simulatorCaches, .simulators, .xcodeApps,
+             .toolchains, .projectCaches:
             kind.title
         }
     }
@@ -171,7 +167,8 @@ struct XcodeSectionView: View {
         switch kind {
         case .simulators:
             "\(model.simulatorMode.title) · \(RussianPlural.devices(model.scan.simulators?.devices.count ?? 0))"
-        default:
+        case .xcodeCaches, .previews, .deviceSupport, .simulatorCaches, .archives, .xcodeApps,
+             .toolchains, .projectCaches:
             kind.subtitle
         }
     }

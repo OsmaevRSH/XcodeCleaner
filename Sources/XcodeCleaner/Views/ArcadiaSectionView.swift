@@ -62,6 +62,7 @@ struct ArcadiaSectionView: View {
                 }
                 .width(110)
             }
+            .scanningOverlay(model.isScanning)
 
             if let retryPath = model.unmountRetryPath {
                 HStack {

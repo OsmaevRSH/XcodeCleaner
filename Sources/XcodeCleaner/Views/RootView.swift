@@ -60,8 +60,10 @@ struct RootView: View {
     }
 
     private var freedBytes: Int64? {
-        guard model.showsLastResult else { return nil }
-        return model.lastReport?.freedBytes
+        guard model.showsLastResult, let freed = model.lastReport?.freedBytes else { return nil }
+        // The figure is a delta between two `df` readings, and other processes write while a
+        // cleanup runs, so it can come out negative. «Освободилось -1,2 ГБ» is not a report.
+        return max(0, freed)
     }
 
     @ViewBuilder
@@ -69,7 +71,7 @@ struct RootView: View {
         switch model.section {
         case .xcode: XcodeSectionView(model: model)
         case .arcadia: ArcadiaSectionView(model: model)
-        case .log: LogView(lines: model.logLines)
+        case .log: LogView(model: model)
         }
     }
 
@@ -110,7 +112,11 @@ struct RootView: View {
             Button("Размонтировать выбранные") {
                 Task { await model.unmountSelected() }
             }
-            .disabled(model.selectedMounts.contains { $0.mount.isMounted } == false || model.isWorking)
+            .disabled(
+                model.selectedMounts.contains { $0.mount.isMounted } == false
+                    || model.isWorking
+                    || model.isScanning
+            )
             Button(
                 "Удалить \(RussianPlural.mounts(model.selectedMounts.count)) · \(ByteFormatting.string(model.arcadiaBytesToFree))",
                 role: .destructive

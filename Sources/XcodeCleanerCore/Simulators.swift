@@ -59,7 +59,7 @@ public struct SimulatorInventory: Sendable, Equatable {
             id: "simulators",
             kind: .simulators,
             title: mode.title,
-            subtitle: "\(devices.count) устройств, \(unavailableDevices.count) недоступно, \(runtimes.count) runtimes",
+            subtitle: "\(RussianPlural.devices(devices.count)), \(unavailableDevices.count) недоступно, \(runtimes.count) runtimes",
             action: .simulators(mode),
             sizeBytes: estimatedFreedBytes(for: mode),
             isDestructive: mode.isDestructive

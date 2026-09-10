@@ -65,6 +65,22 @@ private struct SizeUpdate: Sendable {
     let bytes: Int64
 }
 
+/// A log line with an identity of its own. The text repeats — «  simctl delete unavailable» looks
+/// the same every run — so `ForEach` cannot key on it, and keying on the index means rebuilding an
+/// array of every line on every append.
+struct LogEntry: Identifiable, Hashable {
+    let id: Int
+    let text: String
+}
+
+/// Carries every failure of a batch instead of only the first: the run does not stop at the first
+/// mount that refused, so the report must not either.
+private struct MountBatchError: LocalizedError {
+    let messages: [String]
+
+    var errorDescription: String? { messages.joined(separator: "\n") }
+}
+
 @MainActor
 @Observable
 final class AppModel {
@@ -92,8 +108,15 @@ final class AppModel {
         }
     }
 
-    var section: Section = .xcode
-    var scan = ScanResult()
+    var section: Section = .xcode {
+        // The retry offer belongs to the unmount the user just watched fail, not to the session.
+        didSet { unmountRetryPath = nil }
+    }
+
+    var scan = ScanResult() {
+        didSet { rebuildItems() }
+    }
+
     var isScanning = false
     var isWorking = false
     var isMeasuring = false
@@ -101,10 +124,25 @@ final class AppModel {
     var sizes: [String: Int64] = [:]
     var selectedItemIDs: Set<String> = []
     var expandedKinds: Set<CleanupKind> = []
-    var simulatorMode: SimulatorMode = .deleteUnavailable
-    var archiveMaxAgeDays = 30
+    /// Both of these change what is effectively selected, so they clear the last result the same
+    /// way ticking a checkbox does — otherwise the header keeps reporting a finished cleanup while
+    /// the button already offers a different total.
+    var simulatorMode: SimulatorMode = .deleteUnavailable {
+        didSet {
+            rebuildItems()
+            selectionChanged()
+        }
+    }
+
+    var archiveMaxAgeDays = 30 {
+        didSet {
+            rebuildItems()
+            selectionChanged()
+        }
+    }
+
     var selectedMountIDs: Set<String> = []
-    var logLines: [String] = []
+    private(set) var logEntries: [LogEntry] = []
     var lastReport: CleanupReport?
     /// Whether the header still shows the result of the last cleanup instead of the pending total.
     var showsLastResult = false
@@ -118,6 +156,7 @@ final class AppModel {
     private let mountManager: ArcMountManager
     private var logFile: CleanupLogFile?
     private var hasPreselected = false
+    private var nextLogID = 0
     private var measureTask: Task<Void, Never>?
     /// Bumped whenever measuring is restarted, so a batch from an abandoned run is discarded
     /// instead of landing on top of a fresh scan.
@@ -132,7 +171,12 @@ final class AppModel {
 
     // MARK: Items
 
-    var items: [CleanupItem] {
+    /// Rebuilt only when the scan, the simulator mode or the archive age changes. Every read used
+    /// to redo the whole thing — an array build, an archive filter and a string interpolation per
+    /// item — and a single render pass asks for it dozens of times.
+    private(set) var items: [CleanupItem] = []
+
+    private func rebuildItems() {
         var all = scan.cacheItems + scan.projectCacheItems
         if let simulators = scan.simulators {
             all.append(simulators.makeItem(mode: simulatorMode))
@@ -140,7 +184,7 @@ final class AppModel {
         all += ArchiveScanner.olderThan(days: archiveMaxAgeDays, scan.archives).map { $0.makeItem() }
         all += scan.xcodes.filter { $0.isActive == false }.map { $0.makeItem() }
         all += scan.toolchains.filter { $0.isProtected == false }.map { $0.makeItem() }
-        return all
+        items = all
     }
 
     func items(for kind: CleanupKind) -> [CleanupItem] {
@@ -285,6 +329,12 @@ final class AppModel {
         sizes = [:]
         defer { isScanning = false }
         scan = await scanner.scan()
+        // The offer to retry with --force only means anything while the mount it points at is
+        // still mounted; anything else leaves a banner about a mount that is already gone.
+        if let path = unmountRetryPath,
+           scan.mounts.contains(where: { $0.mount.mount == path && $0.mount.isMounted }) == false {
+            unmountRetryPath = nil
+        }
         let validIDs = Set(items.map(\.id))
         selectedItemIDs.formIntersection(validIDs)
         selectedMountIDs.formIntersection(Set(scan.mounts.map(\.id)))
@@ -293,8 +343,15 @@ final class AppModel {
         // Later scans respect whatever the user picked.
         if hasPreselected == false {
             hasPreselected = true
+            // `.projectCaches` is `.safe` and does come back, but only through a full Tuist and
+            // SwiftPM re-resolve in every mount, over the network and the SPM registry. A first run
+            // must not arrive already armed to do that, so it stays selectable and stays unpicked.
             selectedItemIDs.formUnion(
-                items.filter { $0.kind.group == .safe && $0.isDestructive == false }.map(\.id)
+                items
+                    .filter {
+                        $0.kind.group == .safe && $0.isDestructive == false && $0.kind != .projectCaches
+                    }
+                    .map(\.id)
             )
         }
         for warning in scan.warnings {
@@ -320,7 +377,10 @@ final class AppModel {
             for await update in stream {
                 pending[update.id] = update.bytes
                 let now = ContinuousClock.now
-                guard now - lastFlush >= .milliseconds(150) else { continue }
+                // Time alone is a leading-edge gate: a size that arrives long after the previous
+                // one waits for a successor that may be tens of seconds away, with its row
+                // spinning the whole time. A handful of pending sizes flushes on count instead.
+                guard pending.count >= 4 || now - lastFlush >= .milliseconds(150) else { continue }
                 lastFlush = now
                 self?.apply(pending, generation: generation)
                 pending.removeAll(keepingCapacity: true)
@@ -378,12 +438,20 @@ final class AppModel {
     }
 
     func confirmXcodeCleanup() async {
-        let items = selectedItems
+        // The selection and the scan it came from are read together: the deleter's allowlist is
+        // derived from the scan, so a suspension point between the two reads could hand a set of
+        // items to a deleter built for a different scan.
+        let selection = selectedItems
+        let snapshot = scan
         pendingConfirmation = nil
         cancelMeasuring()
         await work {
-            let cleaner = Cleaner(runner: runner, deleter: scanner.makeDeleter(for: scan), home: cachePaths.home)
-            let report = try await cleaner.run(items) { [weak self] line in
+            let cleaner = Cleaner(
+                runner: runner,
+                deleter: scanner.makeDeleter(for: snapshot),
+                home: cachePaths.home
+            )
+            let report = try await cleaner.run(selection) { [weak self] line in
                 Task { @MainActor in self?.log(line) }
             }
             lastReport = report
@@ -403,17 +471,22 @@ final class AppModel {
         unmountRetryPath = nil
         cancelMeasuring()
         await work {
+            var failures: [String] = []
             for info in mounts {
                 do {
                     try await mountManager.unmount(info.mount.mount, force: force) { [weak self] line in
                         Task { @MainActor in self?.log(line) }
                     }
-                } catch let error as ArcMountError {
-                    if case .commandFailed = error, force == false {
+                } catch {
+                    if force == false, unmountRetryPath == nil,
+                       let mountError = error as? ArcMountError, case .commandFailed = mountError {
                         unmountRetryPath = info.mount.mount
                     }
-                    throw error
+                    failures.append("\(info.mount.name): \(error.localizedDescription)")
                 }
+            }
+            guard failures.isEmpty else {
+                throw MountBatchError(messages: failures)
             }
         }
         await rescan()
@@ -450,12 +523,20 @@ final class AppModel {
         pendingConfirmation = nil
         cancelMeasuring()
         await work {
+            var failures: [String] = []
             for info in mounts {
-                // The store size is whatever the streamed scan already measured, so the removal
-                // never re-walks gigabytes just to report the space it freed.
-                try await mountManager.remove(info.mount, knownStoreSize: size(of: info)) { [weak self] line in
-                    Task { @MainActor in self?.log(line) }
+                do {
+                    // The store size is whatever the streamed scan already measured, so the removal
+                    // never re-walks gigabytes just to report the space it freed.
+                    try await mountManager.remove(info.mount, knownStoreSize: size(of: info)) { [weak self] line in
+                        Task { @MainActor in self?.log(line) }
+                    }
+                } catch {
+                    failures.append("\(info.mount.name): \(error.localizedDescription)")
                 }
+            }
+            guard failures.isEmpty else {
+                throw MountBatchError(messages: failures)
             }
         }
         await rescan()
@@ -470,15 +551,30 @@ final class AppModel {
         do {
             try await body()
         } catch {
-            errorMessage = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+            errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
 
+    /// A cleanup streams every `simctl` and `arc` line through here, so the buffer is capped and
+    /// trimmed in blocks rather than per line. The complete log is on disk either way.
+    private static let logLineLimit = 5000
+    private static let logTrimSize = 1000
+
     func log(_ line: String) {
-        logLines.append(line)
+        logEntries.append(LogEntry(id: nextLogID, text: line))
+        nextLogID += 1
+        if logEntries.count > Self.logLineLimit {
+            logEntries.removeFirst(Self.logTrimSize)
+        }
         if logFile == nil {
             logFile = try? CleanupLogFile(directory: CleanupLogFile.defaultDirectory(home: cachePaths.home))
         }
         logFile?.appendLine(line)
+    }
+
+    /// The walks outlive the model otherwise: each one holds a thread of the cooperative pool, and
+    /// some of them are inside FUSE mounts.
+    isolated deinit {
+        measureTask?.cancel()
     }
 }

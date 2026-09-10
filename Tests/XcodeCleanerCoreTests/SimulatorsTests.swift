@@ -96,7 +96,7 @@ final class SimulatorsTests: XCTestCase {
         XCTAssertEqual(item.action, .simulators(.deleteAll))
         XCTAssertEqual(item.sizeBytes, 4500)
         XCTAssertTrue(item.isDestructive)
-        XCTAssertEqual(item.subtitle, "2 устройств, 1 недоступно, 3 runtimes")
+        XCTAssertEqual(item.subtitle, "2 устройства, 1 недоступно, 3 runtimes")
     }
 
     func test_runtimesSizeExcludesNonDeletableRuntimes() throws {

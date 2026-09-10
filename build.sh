@@ -11,14 +11,14 @@ swift build -c release
 BIN_DIR="$(swift build -c release --show-bin-path)"
 APP_DIR=".build/${APP_NAME}.app"
 
-[[ -d "$APP_DIR" ]] && rm -r "$APP_DIR"
+rm -rf "$APP_DIR"
 mkdir -p "${APP_DIR}/Contents/MacOS" "${APP_DIR}/Contents/Resources"
 cp "${BIN_DIR}/${APP_NAME}" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 
 ICON_KEY=""
 if [[ -f Assets/AppIcon.png ]]; then
   ICONSET=".build/AppIcon.iconset"
-  [[ -d "$ICONSET" ]] && rm -r "$ICONSET"
+  rm -rf "$ICONSET"
   mkdir -p "$ICONSET"
   for size in 16 32 128 256 512; do
     sips -z $size $size Assets/AppIcon.png --out "${ICONSET}/icon_${size}x${size}.png" >/dev/null
@@ -52,6 +52,6 @@ PLIST
 codesign --force --sign - "$APP_DIR"
 
 DEST="${HOME}/Desktop/${APP_NAME}.app"
-[[ -d "$DEST" ]] && rm -r "$DEST"
+rm -rf "$DEST"
 cp -R "$APP_DIR" "$DEST"
 print "Готово: ${DEST}"
