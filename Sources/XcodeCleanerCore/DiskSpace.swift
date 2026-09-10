@@ -15,10 +15,18 @@ public struct DiskSpace: Sendable, Equatable {
         case unavailable(String)
     }
 
+    /// Свободное место на томе, которому принадлежит `url`.
+    ///
+    /// Foundation кэширует значения ресурсов на экземпляре `URL`: после удаления
+    /// файлов тот же экземпляр продолжает отдавать прежний объём. Приложение
+    /// хранит домашний каталог в одном `URL` и спрашивает место до и после
+    /// очистки, поэтому запрос идёт через свежий экземпляр с очищенным кэшем.
     public static func current(
         for url: URL = FileManager.default.homeDirectoryForCurrentUser
     ) throws -> DiskSpace {
-        let values = try url.resourceValues(forKeys: [
+        var probe = URL(fileURLWithPath: url.path)
+        probe.removeAllCachedResourceValues()
+        let values = try probe.resourceValues(forKeys: [
             .volumeTotalCapacityKey,
             .volumeAvailableCapacityForImportantUsageKey,
         ])
