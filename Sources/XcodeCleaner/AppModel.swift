@@ -456,7 +456,6 @@ final class AppModel {
             }
             lastReport = report
             showsLastResult = report.freedBytes != nil
-            section = .log
         }
         await rescan()
     }
