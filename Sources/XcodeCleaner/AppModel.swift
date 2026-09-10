@@ -202,9 +202,19 @@ final class AppModel {
         }
     }
 
-    func isGroupSelected(_ kind: CleanupKind) -> Bool {
+    /// How much of a category is picked, so its header can show the third state a category really
+    /// has. With four of five archives picked a two-state checkbox reads as empty, while all four
+    /// are still counted and still deleted.
+    func selectionState(of kind: CleanupKind) -> (selected: Int, total: Int) {
         let group = items(for: kind)
-        return group.isEmpty == false && group.allSatisfy { selectedItemIDs.contains($0.id) }
+        return (group.filter { selectedItemIDs.contains($0.id) }.count, group.count)
+    }
+
+    /// Picks the whole category, unless it is already whole — then it clears it.
+    func toggleGroupSelection(_ kind: CleanupKind) {
+        let state = selectionState(of: kind)
+        guard state.total > 0 else { return }
+        setSelected(kind: kind, state.selected < state.total)
     }
 
     func isSelected(_ mount: ArcMountInfo) -> Bool {
@@ -355,9 +365,13 @@ final class AppModel {
 
     // MARK: Arcadia
 
+    /// Measuring stops before `arc` is asked to unmount anything: a `readdir` inside a live FUSE
+    /// mount is exactly what makes the volume report as busy, and the app must not be the process
+    /// that blocks its own unmount and then offers `--force` for it.
     func unmountSelected(force: Bool = false) async {
         let mounts = selectedMounts.filter { $0.mount.isMounted }
         unmountRetryPath = nil
+        cancelMeasuring()
         await work {
             for info in mounts {
                 do {
@@ -378,6 +392,7 @@ final class AppModel {
     func retryUnmountWithForce() async {
         guard let path = unmountRetryPath else { return }
         unmountRetryPath = nil
+        cancelMeasuring()
         await work {
             try await mountManager.unmount(path, force: true) { [weak self] line in
                 Task { @MainActor in self?.log(line) }

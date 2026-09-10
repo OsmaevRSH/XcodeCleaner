@@ -43,12 +43,7 @@ struct XcodeSectionView: View {
 
     private func category(_ kind: CleanupKind) -> some View {
         HStack(spacing: 10) {
-            Toggle("", isOn: Binding(
-                get: { model.isGroupSelected(kind) },
-                set: { model.setSelected(kind: kind, $0) }
-            ))
-            .toggleStyle(.checkbox)
-            .labelsHidden()
+            categoryCheckbox(kind)
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
@@ -80,6 +75,30 @@ struct XcodeSectionView: View {
             .help(model.isExpanded(kind) ? "Свернуть" : "Показать, что внутри")
         }
         .padding(.vertical, 2)
+    }
+
+    /// A checkbox with all three states a category can be in. `Toggle` has two, so a category with
+    /// part of it picked would look exactly like one with nothing picked.
+    private func categoryCheckbox(_ kind: CleanupKind) -> some View {
+        let state = model.selectionState(of: kind)
+        return Button {
+            model.toggleGroupSelection(kind)
+        } label: {
+            Image(systemName: Self.checkboxSymbol(selected: state.selected, total: state.total))
+                .imageScale(.large)
+                .foregroundStyle(state.selected == 0 ? Color.secondary : Color.accentColor)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text(title(for: kind)))
+        .accessibilityValue(Text("Выбрано \(state.selected) из \(state.total)"))
+        .help("Выбрано \(state.selected) из \(state.total)")
+    }
+
+    private static func checkboxSymbol(selected: Int, total: Int) -> String {
+        if selected == 0 || total == 0 {
+            return "square"
+        }
+        return selected == total ? "checkmark.square.fill" : "minus.square.fill"
     }
 
     private func categorySize(_ kind: CleanupKind) -> some View {
