@@ -1,7 +1,7 @@
 import Foundation
 
 public enum ByteFormatting {
-    private static let units = ["B", "KB", "MB", "GB", "TB"]
+    private static let units = ["Б", "КБ", "МБ", "ГБ", "ТБ"]
 
     public static func string(_ bytes: Int64) -> String {
         var value = Double(bytes.magnitude)
@@ -18,6 +18,8 @@ public enum ByteFormatting {
             value /= 1024
             unitIndex += 1
         }
-        return String(format: "%@%.2f %@", sign, value, units[unitIndex])
+        let decimals = value < 10 ? 1 : 0
+        let number = String(format: "%.\(decimals)f", value).replacingOccurrences(of: ".", with: ",")
+        return "\(sign)\(number) \(units[unitIndex])"
     }
 }
