@@ -71,14 +71,27 @@ public struct Scanner: Sendable {
         return result
     }
 
+    /// How many directory walks run at once. Each child task blocks its thread for the whole walk,
+    /// so seeding one per target puts a walk on every thread of the cooperative pool and leaves
+    /// nothing to run the rest of the app on. Some targets are project caches inside live FUSE
+    /// mounts, where a stale mount can park a thread in `readdir` well past the point where
+    /// `DirectorySizer`'s cancellation poll could get it back — so this ceiling is also what stops
+    /// one hung mount from taking the whole pool with it.
+    private static let measurementConcurrency = 4
+
     /// Measures every size the scan left unknown, calling back per measurement as it completes.
     /// Keys are `CleanupItem.id` for cleanup items and `ArcMountInfo.id` for Arcadia stores.
-    /// Honours task cancellation between measurements.
     ///
     /// Walking these trees is what used to make a scan take half a minute — sizing the Arcadia
     /// stores alone costs tens of seconds, and neither `du` nor more parallelism makes it
     /// meaningfully faster. So the walks happen here instead, after the list is on screen, and
     /// each answer is handed over the moment it is ready.
+    ///
+    /// - Parameter onSize: invoked off the main thread, on a cooperative-pool thread, in completion
+    ///   order rather than target order. The drain loop below is its only caller, so two calls
+    ///   never overlap — a `@MainActor` sink still has to hop, but it needs no lock of its own.
+    ///   Cancellation is honoured between measurements: ids not reported by then simply stay
+    ///   unknown, and this function returning is the only signal that no more are coming.
     public func measureSizes(
         for result: ScanResult,
         onSize: @escaping @Sendable (String, Int64) -> Void
@@ -86,20 +99,31 @@ public struct Scanner: Sendable {
         let targets = Self.measurementTargets(for: result)
         guard targets.isEmpty == false, Task.isCancelled == false else { return }
         await withTaskGroup(of: (String, Int64).self) { group in
-            for target in targets {
-                // A freshly created `FileManager` is owned by the child task alone, so nothing has
-                // to cross an isolation boundary and `group.cancelAll()` reaches the walk itself:
-                // `DirectorySizer` polls `Task.isCancelled`, which a detached task would not see.
+            // A freshly created `FileManager` is owned by the child task alone, so nothing has to
+            // cross an isolation boundary and `group.cancelAll()` reaches the walk itself:
+            // `DirectorySizer` polls `Task.isCancelled`, which a detached task would not see.
+            var next = 0
+            while next < min(Self.measurementConcurrency, targets.count) {
+                let target = targets[next]
                 group.addTask(priority: .utility) {
                     (target.id, DirectorySizer.size(of: target.url, fileManager: FileManager()))
                 }
+                next += 1
             }
+            // One walk starts for every result drained, so the group never holds more than
+            // `measurementConcurrency` children no matter how many targets there are.
             for await (id, bytes) in group {
                 if Task.isCancelled {
                     group.cancelAll()
                     break
                 }
                 onSize(id, bytes)
+                guard next < targets.count else { continue }
+                let target = targets[next]
+                group.addTask(priority: .utility) {
+                    (target.id, DirectorySizer.size(of: target.url, fileManager: FileManager()))
+                }
+                next += 1
             }
         }
     }

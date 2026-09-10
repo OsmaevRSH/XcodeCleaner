@@ -121,7 +121,7 @@ Xcode.app и toolchains, проектные кэши, а также управл
   элемент на другом `st_dev` пропускается с ошибкой. Archives, Xcode.app и
   toolchains отправляются в Корзину через `FileManager.trashItem`; кэши
   удаляются напрямую.
-- `ArcMountManager` (Sendable struct без состояния): mount/unmount/forget/rmdir(2) через `CommandRunner`; размеры store считаются отдельно и параллельно в `storeSizes(for:)`.
+- `ArcMountManager` (Sendable struct без состояния): mount/unmount/forget/rmdir(2) через `CommandRunner`; размеры store считаются вместе с остальными в `Scanner.measureSizes(for:onSize:)`.
 - `CommandRunner` (protocol + `ProcessCommandRunner`): запуск `Process`,
   построчный стриминг stdout/stderr в лог через `@Sendable` callback.
 - `AppModel` (`@Observable`, `@MainActor`): состояние UI, выбор, диск,

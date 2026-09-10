@@ -608,54 +608,6 @@ final class ArcMountsTests: XCTestCase {
         }
     }
 
-    func test_storeSizesSkipMainMountAndSumStores() async throws {
-        let temp = try TemporaryDirectory()
-        defer { temp.remove() }
-        let store = try temp.makeDirectory("store-a")
-        try temp.makeFile("store-a/blob.bin", bytes: 4096)
-        let manager = ArcMountManager(runner: FakeCommandRunner(), home: temp.url)
-        let main = ArcMount(
-            status: .mounted,
-            mount: temp.url.appendingPathComponent("arcadia").path,
-            store: store.path,
-            objectStore: "/o"
-        )
-        let other = ArcMount(
-            status: .mounted,
-            mount: temp.url.appendingPathComponent("arcadia_SAFTIOS-1").path,
-            store: store.path,
-            objectStore: "/o"
-        )
-
-        let sizes = await manager.storeSizes(for: [main, other])
-
-        XCTAssertNil(sizes[main.mount])
-        XCTAssertGreaterThanOrEqual(sizes[other.mount] ?? 0, 4096)
-    }
-
-    func test_storeSizeMeasuresOneStoreAndSkipsMainMount() throws {
-        let temp = try TemporaryDirectory()
-        defer { temp.remove() }
-        let store = try temp.makeDirectory("store-a")
-        try temp.makeFile("store-a/blob.bin", bytes: 4096)
-        let manager = ArcMountManager(runner: FakeCommandRunner(), home: temp.url)
-        let main = ArcMount(
-            status: .mounted,
-            mount: temp.url.appendingPathComponent("arcadia").path,
-            store: store.path,
-            objectStore: "/o"
-        )
-        let other = ArcMount(
-            status: .mounted,
-            mount: temp.url.appendingPathComponent("arcadia_SAFTIOS-1").path,
-            store: store.path,
-            objectStore: "/o"
-        )
-
-        XCTAssertNil(manager.storeSize(for: main))
-        XCTAssertGreaterThanOrEqual(manager.storeSize(for: other) ?? 0, 4096)
-    }
-
     func test_listDoesNotMeasureStoreSizes() async throws {
         let temp = try TemporaryDirectory()
         defer { temp.remove() }

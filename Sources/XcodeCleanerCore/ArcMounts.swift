@@ -148,6 +148,7 @@ public struct ArcMountManager: Sendable {
     /// moves it — while the store root's own mtime stays at the moment the store was created. The
     /// metadata directory is therefore the honest answer to "when was this mount last touched"; the
     /// root is only a fallback for a store arc has not populated yet.
+    ///
     /// The store is spelled the way `arc` reported it, which may be a `~` path — and
     /// `URL(fileURLWithPath:)` would resolve that against the process's current directory instead
     /// of this manager's home — so it goes through the same normalisation as every other path here.
@@ -157,48 +158,9 @@ public struct ArcMountManager: Sendable {
             ?? Self.modificationDate(of: root.path, fileManager: fileManager)
     }
 
-    /// Sizing the per-mount stores walks tens of gigabytes, so each store is walked in its own
-    /// child task at utility priority and only for the mounts that can actually be removed; the
-    /// main mount is skipped entirely. Child tasks — unlike detached ones — inherit cancellation,
-    /// which is what lets `DirectorySizer` abandon a walk in progress.
-    public func storeSizes(for mounts: [ArcMount]) async -> [String: Int64] {
-        let main = comparablePath(mainMountPath)
-        return await withTaskGroup(of: (String, Int64).self) { group in
-            for mount in mounts where comparablePath(mount.mount) != main {
-                let key = mount.mount
-                let store = mount.store
-                // A freshly created `FileManager` is owned by the child task alone, so nothing has
-                // to cross an isolation boundary and `group.cancelAll()` reaches the walk itself.
-                group.addTask(priority: .utility) {
-                    (key, DirectorySizer.size(of: URL(fileURLWithPath: store), fileManager: FileManager()))
-                }
-            }
-            var sizes: [String: Int64] = [:]
-            for await (key, size) in group {
-                if Task.isCancelled {
-                    group.cancelAll()
-                    break
-                }
-                sizes[key] = size
-            }
-            return sizes
-        }
-    }
-
-    /// Size of one mount's store, measured synchronously. Returns nil for the main mount.
-    ///
-    /// The single-mount counterpart of `storeSizes(for:)`, so a caller can walk one store at a time
-    /// and show each number as it arrives instead of waiting for all of them.
-    public func storeSize(for mount: ArcMount) -> Int64? {
-        guard comparablePath(mount.mount) != comparablePath(mainMountPath) else { return nil }
-        // A private `FileManager`: the walk may run on any thread, and the injected instance is
-        // shared with everything else this manager does.
-        return DirectorySizer.size(of: URL(fileURLWithPath: mount.store), fileManager: FileManager())
-    }
-
     /// Deliberately measures nothing: one `arc mount --list` plus one `stat` per store, so the list
-    /// appears at once. `storeSizeBytes` stays nil until a caller fills it in with `storeSize(for:)`
-    /// or `storeSizes(for:)`.
+    /// appears at once. `storeSizeBytes` stays nil until a caller fills it in — for the app that is
+    /// `Scanner.measureSizes(for:onSize:)`.
     public func list() async throws -> [ArcMountInfo] {
         let mounts = try await mounts()
         let mainPath = comparablePath(mainMountPath)

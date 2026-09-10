@@ -75,22 +75,22 @@ final class ScannerTests: XCTestCase {
         )
     }
 
+    /// Every size the scan cannot get for free stays nil, which is the structural form of "no tree
+    /// was walked" — a wall-clock bound would only say the machine happened to be fast.
     func test_scanLeavesEverySizeUnknown() async throws {
         let fixture = try makeFixture()
         defer { fixture.temp.remove() }
 
-        let started = Date()
         let result = await fixture.scanner.scan()
-        let elapsed = Date().timeIntervalSince(started)
 
         XCTAssertTrue(result.cacheItems.contains { $0.id == fixture.derivedData.path })
         XCTAssertTrue(result.cacheItems.allSatisfy { $0.sizeBytes == nil })
+        XCTAssertTrue(result.projectCacheItems.allSatisfy { $0.sizeBytes == nil })
         XCTAssertEqual(result.archives.map(\.sizeBytes), [nil])
         XCTAssertEqual(result.xcodes.map(\.sizeBytes), [nil])
         let realToolchain = try XCTUnwrap(result.toolchains.first { $0.url.path == fixture.toolchain.path })
         XCTAssertNil(realToolchain.sizeBytes)
         XCTAssertTrue(result.mounts.allSatisfy { $0.storeSizeBytes == nil })
-        XCTAssertLessThan(elapsed, 5)
     }
 
     func test_symlinkedToolchainNeedsNoMeasurement() async throws {
@@ -117,6 +117,8 @@ final class ScannerTests: XCTestCase {
         XCTAssertEqual(collector[fixture.xcode.path], DirectorySizer.size(of: fixture.xcode))
         XCTAssertEqual(collector[fixture.toolchain.path], DirectorySizer.size(of: fixture.toolchain))
         XCTAssertNil(collector[fixture.symlinkedToolchain.path])
+        // Refilling the bounded group must not hand the same target out twice.
+        XCTAssertEqual(collector.reportedIDs.count, collector.callCount)
     }
 
     func test_measureSizesReportsNonMainArcadiaStoresOnly() async throws {
@@ -148,6 +150,8 @@ final class ScannerTests: XCTestCase {
         await fulfillment(of: [finished], timeout: 5)
         let measurable = result.cacheItems.count + result.projectCacheItems.count
             + result.archives.count + result.xcodes.count + 1 + 1
-        XCTAssertLessThanOrEqual(collector.reportedIDs.count, measurable)
+        XCTAssertGreaterThan(measurable, 0)
+        XCTAssertLessThan(collector.reportedIDs.count, measurable)
+        XCTAssertEqual(collector.reportedIDs.count, collector.callCount)
     }
 }
