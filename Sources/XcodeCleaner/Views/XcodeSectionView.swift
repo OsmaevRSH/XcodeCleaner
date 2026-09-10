@@ -3,6 +3,9 @@ import XcodeCleanerCore
 
 /// One row per category, never one per path: the paths are what made the old list unreadable, so
 /// they live in the expanded area and in tooltips.
+///
+/// A click anywhere on a row ticks that row's checkbox. The checkbox is a 14-point square, and
+/// aiming at it was the whole cost of picking anything.
 struct XcodeSectionView: View {
     @Bindable var model: AppModel
 
@@ -57,18 +60,30 @@ struct XcodeSectionView: View {
 
             categorySize(kind)
 
-            Button {
-                model.toggleExpanded(kind)
-            } label: {
-                Image(systemName: "chevron.right")
-                    .rotationEffect(.degrees(model.isExpanded(kind) ? 90 : 0))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 16)
-            }
-            .buttonStyle(.plain)
-            .help(model.isExpanded(kind) ? "Свернуть" : "Показать, что внутри")
+            expandButton(kind)
         }
         .padding(.vertical, 2)
+        .contentShape(Rectangle())
+        .onTapGesture { model.toggleGroupSelection(kind) }
+    }
+
+    /// A button of its own, and a deliberately roomy one: the row itself now picks the category, so
+    /// the arrow is the only way left to expand it, and 16 points of it is not a target.
+    private func expandButton(_ kind: CleanupKind) -> some View {
+        let isExpanded = model.isExpanded(kind)
+        let title = isExpanded ? "Свернуть" : "Показать, что внутри"
+        return Button {
+            model.toggleExpanded(kind)
+        } label: {
+            Image(systemName: "chevron.right")
+                .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                .foregroundStyle(.secondary)
+                .frame(width: 28, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text(title))
+        .help(title)
     }
 
     /// A checkbox with all three states a category can be in. `Toggle` has two, so a category with
@@ -150,6 +165,8 @@ struct XcodeSectionView: View {
             }
         }
         .padding(.leading, 24)
+        .contentShape(Rectangle())
+        .onTapGesture { model.toggle(item) }
         .help(item.subtitle)
     }
 
