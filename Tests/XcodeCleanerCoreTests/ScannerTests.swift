@@ -38,11 +38,11 @@ final class ScannerTests: XCTestCase {
         )
 
         let mainMount = try temp.makeDirectory("arcadia")
-        let otherMount = try temp.makeDirectory("arcadia_SAFTIOS-1")
+        let otherMount = try temp.makeDirectory("arcadia_TASK-1")
         let mainStore = try temp.makeDirectory("main-store")
         try temp.makeFile("main-store/objects/pack", bytes: 65536)
-        let otherStore = try temp.makeDirectory(".arc/stores/_arcadia_SAFTIOS-1")
-        try temp.makeFile(".arc/stores/_arcadia_SAFTIOS-1/objects/pack", bytes: 32768)
+        let otherStore = try temp.makeDirectory(".arc/stores/_arcadia_TASK-1")
+        try temp.makeFile(".arc/stores/_arcadia_TASK-1/objects/pack", bytes: 32768)
 
         let mountsJSON = """
         [
