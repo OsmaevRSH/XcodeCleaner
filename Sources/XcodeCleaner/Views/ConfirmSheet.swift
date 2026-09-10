@@ -15,7 +15,9 @@ struct ConfirmSheet: View {
             List(confirmation.entries) { entry in
                 HStack {
                     if entry.isDestructive {
-                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .help("Не восстановится автоматически")
                     }
                     Text(entry.title)
                         .lineLimit(1)
@@ -34,7 +36,7 @@ struct ConfirmSheet: View {
             }
             if confirmation.hasDestructive {
                 Toggle(
-                    "Понимаю, что отмеченные ⚠︎ данные не регенерируются и не восстанавливаются автоматически",
+                    "Понимаю, что отмеченные данные не восстановятся автоматически",
                     isOn: $acknowledged
                 )
                 .toggleStyle(.checkbox)

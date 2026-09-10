@@ -1,25 +1,34 @@
 import SwiftUI
 import XcodeCleanerCore
 
+/// One row per category, never one per path: the paths are what made the old list unreadable, so
+/// they live in the expanded area and in tooltips.
 struct XcodeSectionView: View {
     @Bindable var model: AppModel
 
+    private static let groups: [CleanupGroup] = [.safe, .attention]
+
     var body: some View {
         List {
-            ForEach(CleanupKind.executionOrder) { kind in
-                Section {
-                    controls(for: kind)
-                    let group = model.items(for: kind)
-                    if group.isEmpty {
-                        Text("Нечего чистить")
-                            .foregroundStyle(.secondary)
+            ForEach(Self.groups) { group in
+                let kinds = model.kinds(in: group)
+                if kinds.isEmpty == false {
+                    Section(group.title) {
+                        ForEach(kinds) { kind in
+                            category(kind)
+                            if model.isExpanded(kind) {
+                                controls(for: kind)
+                                ForEach(model.items(for: kind)) { item in
+                                    row(item)
+                                }
+                            }
+                        }
                     }
-                    ForEach(group) { item in
-                        row(item)
-                    }
-                } header: {
-                    header(for: kind)
                 }
+            }
+            if model.items.isEmpty, model.isScanning == false {
+                Text("Нечего чистить")
+                    .foregroundStyle(.secondary)
             }
         }
         .listStyle(.inset)
@@ -32,18 +41,55 @@ struct XcodeSectionView: View {
         }
     }
 
-    private func header(for kind: CleanupKind) -> some View {
-        HStack {
-            Toggle(kind.title, isOn: Binding(
+    private func category(_ kind: CleanupKind) -> some View {
+        HStack(spacing: 10) {
+            Toggle("", isOn: Binding(
                 get: { model.isGroupSelected(kind) },
                 set: { model.setSelected(kind: kind, $0) }
             ))
             .toggleStyle(.checkbox)
-            .font(.headline)
-            Spacer()
-            Text(ByteFormatting.string(model.items(for: kind).reduce(0) { $0 + ($1.sizeBytes ?? 0) }))
+            .labelsHidden()
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(title(for: kind))
+                    if kind.group == .attention {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .help("Не восстановится автоматически")
+                    }
+                }
+                Text(subtitle(for: kind))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 12)
+
+            categorySize(kind)
+
+            Button {
+                model.toggleExpanded(kind)
+            } label: {
+                Image(systemName: "chevron.right")
+                    .rotationEffect(.degrees(model.isExpanded(kind) ? 90 : 0))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16)
+            }
+            .buttonStyle(.plain)
+            .help(model.isExpanded(kind) ? "Свернуть" : "Показать, что внутри")
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func categorySize(_ kind: CleanupKind) -> some View {
+        HStack(spacing: 6) {
+            Text(ByteFormatting.string(model.knownBytes(for: kind)))
                 .monospacedDigit()
                 .foregroundStyle(.secondary)
+            if model.hasPendingSizes(for: kind) {
+                ProgressView().controlSize(.small)
+            }
         }
     }
 
@@ -51,46 +97,63 @@ struct XcodeSectionView: View {
     private func controls(for kind: CleanupKind) -> some View {
         switch kind {
         case .simulators:
-            Picker("Режим", selection: $model.simulatorMode) {
+            Picker("Что сделать с симуляторами", selection: $model.simulatorMode) {
                 ForEach(SimulatorMode.allCases) { mode in
                     Text(mode.title).tag(mode)
                 }
             }
             .pickerStyle(.radioGroup)
+            .padding(.leading, 24)
         case .archives:
-            Stepper("Старше \(model.archiveMaxAgeDays) дней", value: $model.archiveMaxAgeDays, in: 0...365, step: 5)
+            Stepper(
+                "Старше \(RussianPlural.daysAfterOlderThan(model.archiveMaxAgeDays))",
+                value: $model.archiveMaxAgeDays,
+                in: 0...365,
+                step: 5
+            )
+            .padding(.leading, 24)
         default:
             EmptyView()
         }
     }
 
     private func row(_ item: CleanupItem) -> some View {
-        HStack {
-            Toggle(isOn: Binding(
+        HStack(spacing: 10) {
+            Toggle(item.title, isOn: Binding(
                 get: { model.isSelected(item) },
                 set: { _ in model.toggle(item) }
-            )) {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        Text(item.title)
-                        if item.isDestructive {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .foregroundStyle(.orange)
-                                .help("Данные не регенерируются")
-                        }
-                    }
-                    Text(item.subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-            }
+            ))
             .toggleStyle(.checkbox)
-            Spacer()
-            Text(item.sizeBytes.map(ByteFormatting.string) ?? "—")
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            Spacer(minLength: 12)
+            if let bytes = model.size(of: item) {
+                Text(ByteFormatting.string(bytes))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+        }
+        .padding(.leading, 24)
+        .help(item.subtitle)
+    }
+
+    private func title(for kind: CleanupKind) -> String {
+        switch kind {
+        case .archives:
+            "\(kind.title) старше \(RussianPlural.daysAfterOlderThan(model.archiveMaxAgeDays))"
+        default:
+            kind.title
+        }
+    }
+
+    private func subtitle(for kind: CleanupKind) -> String {
+        switch kind {
+        case .simulators:
+            "\(model.simulatorMode.title) · \(RussianPlural.devices(model.scan.simulators?.devices.count ?? 0))"
+        default:
+            kind.subtitle
         }
     }
 }

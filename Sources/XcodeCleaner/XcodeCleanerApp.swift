@@ -7,7 +7,7 @@ struct XcodeCleanerApp: App {
     var body: some Scene {
         WindowGroup("XcodeCleaner") {
             RootView(model: model)
-                .frame(minWidth: 900, minHeight: 600)
+                .frame(minWidth: 900, minHeight: 620)
         }
         .windowResizability(.contentMinSize)
     }
