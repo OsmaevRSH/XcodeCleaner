@@ -1,7 +1,26 @@
 import Foundation
 
+/// The only distinction the user has to make before pressing the button: whether the thing comes
+/// back by itself.
+public enum CleanupGroup: String, Sendable, Hashable, CaseIterable, Identifiable {
+    /// Regenerates by itself; the cost of deleting it is time, not data.
+    case safe
+    /// Does not come back on its own; deleting it means downloading or rebuilding it deliberately.
+    case attention
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .safe: "Восстановится само"
+        case .attention: "Не восстановится автоматически"
+        }
+    }
+}
+
 public enum CleanupKind: String, CaseIterable, Sendable, Hashable, Identifiable {
     case xcodeCaches
+    case previews
     case deviceSupport
     case simulatorCaches
     case simulators
@@ -13,13 +32,14 @@ public enum CleanupKind: String, CaseIterable, Sendable, Hashable, Identifiable 
     public var id: String { rawValue }
 
     public static let executionOrder: [CleanupKind] = [
-        .xcodeCaches, .deviceSupport, .simulatorCaches, .simulators,
+        .xcodeCaches, .previews, .deviceSupport, .simulatorCaches, .simulators,
         .archives, .xcodeApps, .toolchains, .projectCaches,
     ]
 
     public var title: String {
         switch self {
-        case .xcodeCaches: "Кэши Xcode"
+        case .xcodeCaches: "Кэши сборки"
+        case .previews: "Превью и документация"
         case .deviceSupport: "DeviceSupport"
         case .simulatorCaches: "CoreSimulator и SwiftPM"
         case .simulators: "Симуляторы"
@@ -27,6 +47,31 @@ public enum CleanupKind: String, CaseIterable, Sendable, Hashable, Identifiable 
         case .xcodeApps: "Старые Xcode"
         case .toolchains: "Toolchains"
         case .projectCaches: "Проектные кэши"
+        }
+    }
+
+    /// What the user loses, in one line. Never a path: the paths are the item subtitles, and a
+    /// category header full of them is what made the list unreadable.
+    public var subtitle: String {
+        switch self {
+        case .xcodeCaches: "DerivedData и индексы. Первая сборка станет дольше"
+        case .previews: "Кэш SwiftUI Previews и документации Xcode"
+        case .deviceSupport: "Символы iOS, watchOS и tvOS. Скачаются при подключении устройства"
+        case .simulatorCaches: "Кэши CoreSimulator и SwiftPM, логи симуляторов"
+        case .simulators: "Устройства симуляторов и скачанные runtimes"
+        case .archives: "Сборки .xcarchive и dSYM. Уйдут в Корзину"
+        case .xcodeApps: "Неиспользуемые версии Xcode. Уйдут в Корзину"
+        case .toolchains: "Дополнительные Swift toolchains. Уйдут в Корзину"
+        case .projectCaches: "Tuist и SwiftPM внутри проектов. Пересоберутся"
+        }
+    }
+
+    /// Simulators stay `.safe` here because only some of the modes destroy anything; the mode the
+    /// user picked carries `isDestructive` on the item itself.
+    public var group: CleanupGroup {
+        switch self {
+        case .archives, .xcodeApps, .toolchains: .attention
+        case .xcodeCaches, .previews, .deviceSupport, .simulatorCaches, .simulators, .projectCaches: .safe
         }
     }
 }
@@ -110,9 +155,14 @@ public struct CachePaths: Sendable {
     public var xcodeCaches: [URL] {
         [
             library("Developer/Xcode/DerivedData"),
-            library("Developer/Xcode/DocumentationCache"),
-            library("Developer/Xcode/UserData/Previews"),
             library("Caches/com.apple.dt.Xcode"),
+        ]
+    }
+
+    public var previews: [URL] {
+        [
+            library("Developer/Xcode/UserData/Previews"),
+            library("Developer/Xcode/DocumentationCache"),
         ]
     }
 
@@ -141,7 +191,7 @@ public struct CachePaths: Sendable {
     public var mainArcadiaMount: URL { home.appendingPathComponent("arcadia") }
 
     public var allClearable: [URL] {
-        xcodeCaches + deviceSupport + simulatorCaches + globalProjectCaches
+        xcodeCaches + previews + deviceSupport + simulatorCaches + globalProjectCaches
     }
 
     public func projectCacheDirectories(inMount mount: URL) -> [URL] {
@@ -150,6 +200,8 @@ public struct CachePaths: Sendable {
 }
 
 public enum CacheItemBuilder {
+    /// Builds the rows without measuring them: every item leaves with `sizeBytes` nil so the list
+    /// can be shown at once. `Scanner.measureSizes(for:onSize:)` fills the numbers in afterwards.
     public static func items(
         kind: CleanupKind,
         directories: [URL],
@@ -169,7 +221,7 @@ public enum CacheItemBuilder {
                 title: directory.lastPathComponent,
                 subtitle: directory.path,
                 action: .clearContents(directory),
-                sizeBytes: DirectorySizer.size(of: directory, fileManager: fileManager),
+                sizeBytes: nil,
                 isDestructive: false
             )
         }

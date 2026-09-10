@@ -27,9 +27,10 @@ public struct Scanner: Sendable {
         self.fileManager = fileManager
     }
 
-    /// Every sizing pass runs in a child task so that cancelling the scan reaches the tree walks:
-    /// `DirectorySizer` polls `Task.isCancelled`, which a detached task would never observe. Each
-    /// concurrent walk gets its own `FileManager` instead of sharing the stored one.
+    /// Finds everything there is to clean without measuring any of it: no branch of this call
+    /// walks a directory tree, so the list is ready in well under a second even on a machine with
+    /// twenty Arcadia stores. Every size the scan cannot get for free is left nil and filled in
+    /// afterwards by `measureSizes(for:onSize:)`.
     public func scan() async -> ScanResult {
         var result = ScanResult()
         result.disk = try? DiskSpace.current(for: cachePaths.home)
@@ -70,6 +71,57 @@ public struct Scanner: Sendable {
         return result
     }
 
+    /// Measures every size the scan left unknown, calling back per measurement as it completes.
+    /// Keys are `CleanupItem.id` for cleanup items and `ArcMountInfo.id` for Arcadia stores.
+    /// Honours task cancellation between measurements.
+    ///
+    /// Walking these trees is what used to make a scan take half a minute — sizing the Arcadia
+    /// stores alone costs tens of seconds, and neither `du` nor more parallelism makes it
+    /// meaningfully faster. So the walks happen here instead, after the list is on screen, and
+    /// each answer is handed over the moment it is ready.
+    public func measureSizes(
+        for result: ScanResult,
+        onSize: @escaping @Sendable (String, Int64) -> Void
+    ) async {
+        let targets = Self.measurementTargets(for: result)
+        guard targets.isEmpty == false, Task.isCancelled == false else { return }
+        await withTaskGroup(of: (String, Int64).self) { group in
+            for target in targets {
+                // A freshly created `FileManager` is owned by the child task alone, so nothing has
+                // to cross an isolation boundary and `group.cancelAll()` reaches the walk itself:
+                // `DirectorySizer` polls `Task.isCancelled`, which a detached task would not see.
+                group.addTask(priority: .utility) {
+                    (target.id, DirectorySizer.size(of: target.url, fileManager: FileManager()))
+                }
+            }
+            for await (id, bytes) in group {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
+                onSize(id, bytes)
+            }
+        }
+    }
+
+    /// Everything `scan()` left unmeasured, paired with the id the caller knows it by. A toolchain
+    /// that is a symlink is already zero and never appears here; neither does the main Arcadia
+    /// mount, whose store is not removable.
+    private static func measurementTargets(for result: ScanResult) -> [(id: String, url: URL)] {
+        var targets: [(id: String, url: URL)] = []
+        for item in result.cacheItems + result.projectCacheItems {
+            guard item.sizeBytes == nil, case let .clearContents(url) = item.action else { continue }
+            targets.append((item.id, url))
+        }
+        targets += result.archives.filter { $0.sizeBytes == nil }.map { ($0.id, $0.url) }
+        targets += result.xcodes.filter { $0.sizeBytes == nil }.map { ($0.id, $0.url) }
+        targets += result.toolchains.filter { $0.sizeBytes == nil }.map { ($0.id, $0.url) }
+        targets += result.mounts
+            .filter { $0.isMain == false && $0.storeSizeBytes == nil }
+            .map { ($0.id, URL(fileURLWithPath: $0.mount.store)) }
+        return targets
+    }
+
     /// Trashing is only offered for entries the scan actually found, so the allowlist of parents
     /// is derived from those entries rather than from fixed directories: an archive lives in an
     /// `Archives/<day>` folder, never in the archives root, and nothing in `/Applications` becomes
@@ -99,6 +151,7 @@ public struct Scanner: Sendable {
 
     private static func cacheItems(cachePaths: CachePaths, fileManager: FileManager) -> [CleanupItem] {
         CacheItemBuilder.items(kind: .xcodeCaches, directories: cachePaths.xcodeCaches, fileManager: fileManager)
+            + CacheItemBuilder.items(kind: .previews, directories: cachePaths.previews, fileManager: fileManager)
             + CacheItemBuilder.items(kind: .deviceSupport, directories: cachePaths.deviceSupport, fileManager: fileManager)
             + CacheItemBuilder.items(kind: .simulatorCaches, directories: cachePaths.simulatorCaches, fileManager: fileManager)
     }

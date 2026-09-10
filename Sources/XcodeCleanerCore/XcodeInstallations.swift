@@ -3,7 +3,8 @@ import Foundation
 public struct XcodeInstallation: Sendable, Equatable, Identifiable {
     public let url: URL
     public let isActive: Bool
-    public let sizeBytes: Int64
+    /// Nil until somebody measures it: the scan deliberately leaves it unknown.
+    public let sizeBytes: Int64?
 
     public var id: String { url.path }
     public var name: String { url.lastPathComponent }
@@ -24,7 +25,9 @@ public struct XcodeInstallation: Sendable, Equatable, Identifiable {
 public struct ToolchainEntry: Sendable, Equatable, Identifiable {
     public let url: URL
     public let isProtected: Bool
-    public let sizeBytes: Int64
+    /// Nil until somebody measures it, except for a symlinked toolchain: that one is known to be
+    /// zero without walking anything, so it is never handed to a sizer at all.
+    public let sizeBytes: Int64?
 
     public var id: String { url.path }
     public var name: String { url.lastPathComponent }
@@ -65,6 +68,8 @@ public enum XcodeInstallationScanner {
         return stem == "Xcode" || stem.hasPrefix("Xcode-") || stem.hasPrefix("Xcode ")
     }
 
+    /// Lists the installations without walking them: one shallow directory read plus one symlink
+    /// resolution each. Sizes arrive later through `Scanner.measureSizes(for:onSize:)`.
     public static func installations(
         in applications: URL,
         activeDeveloperDir: String,
@@ -83,11 +88,7 @@ public enum XcodeInstallationScanner {
             .map { child in
                 let url = Self.entryURL(base: applications, components: [child.lastPathComponent])
                 let developerPath = url.appendingPathComponent("Contents/Developer").resolvingSymlinksInPath().path
-                return XcodeInstallation(
-                    url: url,
-                    isActive: developerPath == activePath,
-                    sizeBytes: DirectorySizer.size(of: child, fileManager: fileManager)
-                )
+                return XcodeInstallation(url: url, isActive: developerPath == activePath, sizeBytes: nil)
             }
             .sorted { $0.name < $1.name }
     }
@@ -115,7 +116,7 @@ public enum XcodeInstallationScanner {
             return ToolchainEntry(
                 url: url,
                 isProtected: isLatestLink || isLatestTarget,
-                sizeBytes: isSymlink ? 0 : DirectorySizer.size(of: child, fileManager: fileManager)
+                sizeBytes: isSymlink ? 0 : nil
             )
         }
         .sorted { $0.name < $1.name }

@@ -20,7 +20,7 @@ final class ArchivesTests: XCTestCase {
         let archives = ArchiveScanner.archives(in: temp.url)
 
         XCTAssertEqual(Set(archives.map(\.url.path)), [old.path, fresh.path])
-        XCTAssertTrue(archives.allSatisfy { $0.sizeBytes >= 100 })
+        XCTAssertTrue(archives.allSatisfy { $0.sizeBytes == nil }, "the scan must not walk archives")
     }
 
     func test_filtersByAge() throws {

@@ -3,7 +3,8 @@ import Foundation
 public struct ArchiveEntry: Sendable, Equatable, Identifiable {
     public let url: URL
     public let createdAt: Date
-    public let sizeBytes: Int64
+    /// Nil until somebody measures it: the scan deliberately leaves it unknown.
+    public let sizeBytes: Int64?
 
     public var id: String { url.path }
     public var name: String { url.lastPathComponent }
@@ -22,6 +23,8 @@ public struct ArchiveEntry: Sendable, Equatable, Identifiable {
 }
 
 public enum ArchiveScanner {
+    /// Lists the archives without walking any of them: two shallow directory reads, so the list is
+    /// ready immediately. Sizes arrive later through `Scanner.measureSizes(for:onSize:)`.
     public static func archives(in directory: URL, fileManager: FileManager = .default) -> [ArchiveEntry] {
         guard let dayFolders = try? fileManager.contentsOfDirectory(
             at: directory,
@@ -45,11 +48,7 @@ public enum ArchiveScanner {
                     base: directory,
                     components: [folder.lastPathComponent, child.lastPathComponent]
                 )
-                result.append(ArchiveEntry(
-                    url: url,
-                    createdAt: created,
-                    sizeBytes: DirectorySizer.size(of: child, fileManager: fileManager)
-                ))
+                result.append(ArchiveEntry(url: url, createdAt: created, sizeBytes: nil))
             }
         }
         return result.sorted { $0.createdAt < $1.createdAt }

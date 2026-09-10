@@ -87,6 +87,17 @@ final class XcodeInstallationsTests: XCTestCase {
         XCTAssertEqual(byName["swift-5.9-RELEASE.xctoolchain"]?.isProtected, false)
     }
 
+    func test_installationsAreNotSizedByTheScan() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        try temp.makeDirectory("Xcode-16.4.app/Contents/Developer")
+        try temp.makeFile("Xcode-16.4.app/Contents/MacOS/Xcode", bytes: 4096)
+
+        let installations = XcodeInstallationScanner.installations(in: temp.url, activeDeveloperDir: "/none")
+
+        XCTAssertEqual(installations.map(\.sizeBytes), [nil])
+    }
+
     func test_toolchainSizeDecidedBySymlinkNotName() throws {
         let temp = try TemporaryDirectory()
         defer { temp.remove() }
@@ -98,7 +109,7 @@ final class XcodeInstallationsTests: XCTestCase {
 
         let byName = Dictionary(uniqueKeysWithValues: toolchains.map { ($0.name, $0) })
         XCTAssertEqual(byName["swift-latest.xctoolchain"]?.sizeBytes, 0)
-        XCTAssertGreaterThanOrEqual(byName["swift-6.3.3-RELEASE.xctoolchain"]?.sizeBytes ?? 0, 4096)
+        XCTAssertEqual(byName["swift-6.3.3-RELEASE.xctoolchain"]?.sizeBytes, .some(nil))
     }
 
     func test_activeDeveloperDirUsesXcodeSelect() async throws {
