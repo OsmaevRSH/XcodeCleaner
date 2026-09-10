@@ -17,7 +17,7 @@ struct ConfirmSheet: View {
                     if entry.isDestructive {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(.orange)
-                            .help("Не восстановится автоматически")
+                            .help(confirmation.kind.destructiveHint)
                     }
                     Text(entry.title)
                         .lineLimit(1)
@@ -34,23 +34,27 @@ struct ConfirmSheet: View {
                     .font(.headline)
                 Spacer()
             }
+            if confirmation.shutsDownSimulators {
+                Label("Запущенные симуляторы будут выключены", systemImage: "power")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
             if confirmation.hasDestructive {
-                Toggle(
-                    "Понимаю, что отмеченные данные не восстановятся автоматически",
-                    isOn: $acknowledged
-                )
-                .toggleStyle(.checkbox)
+                Toggle(confirmation.kind.acknowledgement, isOn: $acknowledged)
+                    .toggleStyle(.checkbox)
             }
             HStack {
                 Spacer()
+                // Return belongs to «Отмена»: this sheet opens with the destructive button ready,
+                // and a stray Return should never be the thing that deletes.
                 Button("Отмена", role: .cancel, action: onCancel)
-                    .keyboardShortcut(.cancelAction)
-                Button("Удалить", role: .destructive, action: onConfirm)
                     .keyboardShortcut(.defaultAction)
+                Button("Удалить", role: .destructive, action: onConfirm)
                     .disabled(confirmation.hasDestructive && acknowledged == false)
             }
         }
         .padding(20)
         .frame(width: 560)
+        .onExitCommand(perform: onCancel)
     }
 }

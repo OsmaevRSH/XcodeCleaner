@@ -4,29 +4,58 @@ import XcodeCleanerCore
 
 struct ConfirmEntry: Identifiable, Hashable {
     let id: String
+    /// The category the entry came from, or nil for an Arcadia mount, which has none.
+    let kind: CleanupKind?
     let title: String
     let sizeBytes: Int64?
     let isDestructive: Bool
 }
 
 struct Confirmation: Identifiable {
+    /// Deletion means different things in the two flows, so every sentence about consequences
+    /// hangs off the kind instead of one string trying to cover both.
     enum Kind {
+        /// Xcode items: caches are emptied in place, everything else goes to the Trash through
+        /// `SafeDeleter.trash`, so it is still there to drag back out.
         case cleanup
+        /// Arcadia stores: `removeItem`, which never touches the Trash.
         case deleteMounts
+
+        var title: String {
+            switch self {
+            case .cleanup: "Очистить Xcode"
+            case .deleteMounts: "Удалить маунты Arcadia"
+            }
+        }
+
+        var acknowledgement: String {
+            switch self {
+            case .cleanup: "Понимаю, что отмеченные данные уйдут в Корзину и сами не вернутся"
+            case .deleteMounts: "Понимаю, что store будут удалены навсегда, мимо Корзины"
+            }
+        }
+
+        /// What the warning triangle next to an entry means in this flow.
+        var destructiveHint: String {
+            switch self {
+            case .cleanup: "Уйдёт в Корзину, само не вернётся"
+            case .deleteMounts: "Удаляется навсегда, мимо Корзины"
+            }
+        }
     }
 
     let id = UUID()
     let kind: Kind
     let entries: [ConfirmEntry]
 
+    var title: String { kind.title }
     var totalBytes: Int64 { entries.reduce(0) { $0 + ($1.sizeBytes ?? 0) } }
     var hasDestructive: Bool { entries.contains(where: \.isDestructive) }
 
-    var title: String {
-        switch kind {
-        case .cleanup: "Очистить Xcode"
-        case .deleteMounts: "Удалить маунты Arcadia"
-        }
+    /// `Cleaner.run` shuts every booted simulator down before it touches simulator storage. The
+    /// user hears about that here, not from a simulator disappearing mid-run.
+    var shutsDownSimulators: Bool {
+        entries.contains { $0.kind == .simulators || $0.kind == .simulatorCaches }
     }
 }
 
@@ -338,6 +367,7 @@ final class AppModel {
         let entries = selectedItems.map {
             ConfirmEntry(
                 id: $0.id,
+                kind: $0.kind,
                 title: "\($0.kind.title): \($0.title)",
                 sizeBytes: size(of: $0),
                 isDestructive: $0.isDestructive
@@ -405,6 +435,7 @@ final class AppModel {
         let entries = selectedMounts.map {
             ConfirmEntry(
                 id: $0.id,
+                kind: nil,
                 title: "Arcadia: \($0.mount.name)",
                 sizeBytes: size(of: $0),
                 isDestructive: true
