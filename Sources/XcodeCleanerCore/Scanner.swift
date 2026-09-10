@@ -58,7 +58,7 @@ public struct Scanner: Sendable {
         result.archives = await archives
         result.toolchains = await toolchains
 
-        let projectDirectories = ProjectCacheScanner.allowedDirectories(mounts: mountInfos, cachePaths: paths)
+        let projectDirectories = ProjectCacheScanner.directories(mounts: mountInfos, cachePaths: paths)
         async let projectItems = CacheItemBuilder.items(
             kind: .projectCaches,
             directories: projectDirectories,
@@ -67,7 +67,7 @@ public struct Scanner: Sendable {
         result.projectCacheItems = await projectItems
 
         result.warnings = [simulatorWarning, xcodeWarning, mountWarning].compactMap { $0 }
-            + symlinkWarnings(projectDirectories: projectDirectories)
+            + symlinkWarnings(projectDirectories: projectDirectories.map(\.url))
         return result
     }
 

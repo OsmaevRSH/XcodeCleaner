@@ -1,11 +1,22 @@
 import Foundation
 
 public enum ProjectCacheScanner {
-    public static func allowedDirectories(mounts: [ArcMountInfo], cachePaths: CachePaths) -> [URL] {
+    /// Every project cache worth offering, titled so that two mounts never produce two rows that
+    /// read the same.
+    public static func directories(mounts: [ArcMountInfo], cachePaths: CachePaths) -> [CacheDirectory] {
         let inMounts = mounts
             .filter { $0.mount.isMounted }
-            .flatMap { cachePaths.projectCacheDirectories(inMount: URL(fileURLWithPath: $0.mount.mount)) }
+            .flatMap {
+                cachePaths.projectCaches(
+                    inMount: URL(fileURLWithPath: $0.mount.mount),
+                    mountName: $0.mount.name
+                )
+            }
         return cachePaths.globalProjectCaches + inMounts
+    }
+
+    public static func allowedDirectories(mounts: [ArcMountInfo], cachePaths: CachePaths) -> [URL] {
+        directories(mounts: mounts, cachePaths: cachePaths).map(\.url)
     }
 
     public static func items(
@@ -15,7 +26,7 @@ public enum ProjectCacheScanner {
     ) -> [CleanupItem] {
         CacheItemBuilder.items(
             kind: .projectCaches,
-            directories: allowedDirectories(mounts: mounts, cachePaths: cachePaths),
+            directories: directories(mounts: mounts, cachePaths: cachePaths),
             fileManager: fileManager
         )
     }

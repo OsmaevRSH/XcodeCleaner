@@ -130,6 +130,19 @@ public struct CleanupItem: Identifiable, Hashable, Sendable {
     }
 }
 
+/// A directory to clean plus the name it is shown under. The name is carried rather than derived
+/// from the path: several mounts contribute a `.build` each, and a row reading `.build` says
+/// nothing about which one it belongs to.
+public struct CacheDirectory: Sendable, Hashable {
+    public let url: URL
+    public let title: String
+
+    public init(url: URL, title: String) {
+        self.url = url
+        self.title = title
+    }
+}
+
 public struct CachePaths: Sendable {
     public let home: URL
     public let applicationsDirectory: URL
@@ -152,37 +165,43 @@ public struct CachePaths: Sendable {
         home.appendingPathComponent("Library").appendingPathComponent(path)
     }
 
-    public var xcodeCaches: [URL] {
+    private func library(_ path: String, named title: String) -> CacheDirectory {
+        CacheDirectory(url: library(path), title: title)
+    }
+
+    public var xcodeCaches: [CacheDirectory] {
         [
-            library("Developer/Xcode/DerivedData"),
-            library("Caches/com.apple.dt.Xcode"),
+            library("Developer/Xcode/DerivedData", named: "DerivedData"),
+            library("Caches/com.apple.dt.Xcode", named: "Кэш Xcode"),
         ]
     }
 
-    public var previews: [URL] {
+    public var previews: [CacheDirectory] {
         [
-            library("Developer/Xcode/UserData/Previews"),
-            library("Developer/Xcode/DocumentationCache"),
+            library("Developer/Xcode/UserData/Previews", named: "SwiftUI Previews"),
+            library("Developer/Xcode/DocumentationCache", named: "Кэш документации"),
         ]
     }
 
-    public var deviceSupport: [URL] {
+    public var deviceSupport: [CacheDirectory] {
         ["iOS", "watchOS", "tvOS", "visionOS"].map {
-            library("Developer/Xcode/\($0) DeviceSupport")
+            library("Developer/Xcode/\($0) DeviceSupport", named: $0)
         }
     }
 
-    public var simulatorCaches: [URL] {
+    /// Two of these are CoreSimulator's and neither is named after it on disk, so the titles say
+    /// which is which instead of leaving the user with two rows about the same thing.
+    public var simulatorCaches: [CacheDirectory] {
         [
-            library("Developer/CoreSimulator/Caches"),
-            library("Caches/com.apple.CoreSimulator"),
-            library("Caches/org.swift.swiftpm"),
-            library("Logs/CoreSimulator"),
+            library("Developer/CoreSimulator/Caches", named: "CoreSimulator, кэш образов"),
+            library("Caches/com.apple.CoreSimulator", named: "CoreSimulator, системный кэш"),
+            library("Caches/org.swift.swiftpm", named: "SwiftPM, кэш пакетов"),
+            library("Logs/CoreSimulator", named: "Логи симуляторов"),
         ]
     }
 
-    public var globalProjectCaches: [URL] {
-        [home.appendingPathComponent(".cache/tuist")]
+    public var globalProjectCaches: [CacheDirectory] {
+        [CacheDirectory(url: home.appendingPathComponent(".cache/tuist"), title: "Общий кэш Tuist")]
     }
 
     public var archivesDirectory: URL { library("Developer/Xcode/Archives") }
@@ -191,12 +210,39 @@ public struct CachePaths: Sendable {
     public var mainArcadiaMount: URL { home.appendingPathComponent("arcadia") }
 
     public var allClearable: [URL] {
-        xcodeCaches + previews + deviceSupport + simulatorCaches + globalProjectCaches
+        (xcodeCaches + previews + deviceSupport + simulatorCaches + globalProjectCaches).map(\.url)
     }
 
-    public func projectCacheDirectories(inMount mount: URL) -> [URL] {
-        Self.projectCacheSubpaths.map { mount.appendingPathComponent($0) }
+    /// The project caches inside one mount, each titled with the mount's own folder name: every
+    /// mount contributes the same three subpaths, and only the mount tells them apart.
+    public func projectCaches(inMount mount: URL, mountName: String) -> [CacheDirectory] {
+        Self.projectCacheSubpaths.map { subpath in
+            CacheDirectory(
+                url: mount.appendingPathComponent(subpath),
+                title: "\(mountName) · \(Self.projectCacheName(of: subpath))"
+            )
+        }
     }
+
+    /// What distinguishes one project cache from another inside the same mount: the subpaths all
+    /// live in the same project directory, and repeating that directory in every row says nothing.
+    static func projectCacheName(of subpath: String) -> String {
+        subpath.components(separatedBy: "/")
+            .dropFirst(sharedProjectCacheDepth)
+            .joined(separator: "/")
+    }
+
+    /// How many leading components every project subpath has in common — never a whole subpath,
+    /// because something has to survive for the row to have a name at all.
+    private static let sharedProjectCacheDepth: Int = {
+        let split = projectCacheSubpaths.map { $0.components(separatedBy: "/") }
+        guard let first = split.first, let shortest = split.map(\.count).min() else { return 0 }
+        var depth = 0
+        while depth < shortest - 1, split.allSatisfy({ $0[depth] == first[depth] }) {
+            depth += 1
+        }
+        return depth
+    }()
 }
 
 public enum CacheItemBuilder {
@@ -204,23 +250,24 @@ public enum CacheItemBuilder {
     /// can be shown at once. `Scanner.measureSizes(for:onSize:)` fills the numbers in afterwards.
     public static func items(
         kind: CleanupKind,
-        directories: [URL],
+        directories: [CacheDirectory],
         fileManager: FileManager = .default
     ) -> [CleanupItem] {
         directories.compactMap { directory in
+            let url = directory.url
             var isDirectory: ObjCBool = false
-            guard fileManager.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+            guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory),
                   isDirectory.boolValue,
-                  directory.resolvingSymlinksInPath().path == directory.standardizedFileURL.path
+                  url.resolvingSymlinksInPath().path == url.standardizedFileURL.path
             else {
                 return nil
             }
             return CleanupItem(
-                id: directory.path,
+                id: url.path,
                 kind: kind,
-                title: directory.lastPathComponent,
-                subtitle: directory.path,
-                action: .clearContents(directory),
+                title: directory.title,
+                subtitle: url.path,
+                action: .clearContents(url),
                 sizeBytes: nil,
                 isDestructive: false
             )

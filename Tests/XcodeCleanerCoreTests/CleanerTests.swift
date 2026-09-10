@@ -268,7 +268,7 @@ final class CleanerTests: XCTestCase {
         }
         XCTAssertFalse(deleter.clearableDirectories.contains { $0.hasPrefix("/Users/tester/arcadia_old") })
         XCTAssertTrue(deleter.clearableDirectories.contains("/Users/tester/.cache/tuist"))
-        XCTAssertTrue(deleter.clearableDirectories.contains(paths.xcodeCaches[0].path))
+        XCTAssertTrue(deleter.clearableDirectories.contains(paths.xcodeCaches[0].url.path))
     }
 
     func test_makeDeleterTrashesNothingWhenScanFoundNoTrashableEntries() {

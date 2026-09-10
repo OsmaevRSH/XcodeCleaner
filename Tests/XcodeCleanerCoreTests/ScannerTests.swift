@@ -134,6 +134,50 @@ final class ScannerTests: XCTestCase {
         XCTAssertNil(collector[fixture.mainMountPath])
     }
 
+    /// The property the whole naming change is for: whatever a category expands into, no two of its
+    /// rows may read the same. Two mounted mounts each contribute the same three project caches, and
+    /// two of the simulator caches are both CoreSimulator's.
+    func test_noTwoItemsOfAKindShareATitle() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let applications = try temp.makeDirectory("Applications")
+        let clearable = CachePaths(home: temp.url).allClearable
+        for path in clearable {
+            try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+        }
+        let mounts = ["arcadia", "arcadia_TASK-1"].map { temp.url.appendingPathComponent($0) }
+        for mount in mounts {
+            for subpath in CachePaths.projectCacheSubpaths {
+                try temp.makeDirectory("\(mount.lastPathComponent)/\(subpath)")
+            }
+        }
+        let mountsJSON = mounts
+            .map { #"{"status":"mounted","mount":"\#($0.path)","store":"\#($0.path)/store","object-store":"\#($0.path)/o"}"# }
+            .joined(separator: ",")
+        let runner = FakeCommandRunner()
+        runner.respond(to: "arc mount --list --json", stdout: "[\(mountsJSON)]")
+        runner.respond(to: "xcode-select -p", stdout: "/none\n")
+        runner.respond(to: "xcrun simctl list devices -j", stdout: #"{"devices":{}}"#)
+        runner.respond(to: "xcrun simctl runtime list -j", stdout: "{}")
+        let scanner = XcodeCleanerCore.Scanner(
+            runner: runner,
+            cachePaths: CachePaths(home: temp.url, applicationsDirectory: applications)
+        )
+
+        let result = await scanner.scan()
+
+        let items = result.cacheItems + result.projectCacheItems
+        XCTAssertEqual(items.count, clearable.count + 2 * CachePaths.projectCacheSubpaths.count)
+        for (kind, ofKind) in Dictionary(grouping: items, by: \.kind) {
+            XCTAssertEqual(
+                Set(ofKind.map(\.title)).count,
+                ofKind.count,
+                "\(kind) shows the same title twice: \(ofKind.map(\.title))"
+            )
+            XCTAssertTrue(ofKind.allSatisfy { $0.title.isEmpty == false }, "\(kind) has a nameless row")
+        }
+    }
+
     func test_cancelledMeasureSizesReturnsWithoutReportingEverything() async throws {
         let fixture = try makeFixture()
         defer { fixture.temp.remove() }

@@ -6,20 +6,53 @@ final class CleanupModelTests: XCTestCase {
         let home = URL(fileURLWithPath: "/Users/tester")
         let paths = CachePaths(home: home)
 
-        XCTAssertEqual(paths.xcodeCaches.map(\.path), [
+        XCTAssertEqual(paths.xcodeCaches.map(\.url.path), [
             "/Users/tester/Library/Developer/Xcode/DerivedData",
             "/Users/tester/Library/Caches/com.apple.dt.Xcode",
         ])
-        XCTAssertEqual(paths.previews.map(\.path), [
+        XCTAssertEqual(paths.previews.map(\.url.path), [
             "/Users/tester/Library/Developer/Xcode/UserData/Previews",
             "/Users/tester/Library/Developer/Xcode/DocumentationCache",
         ])
         XCTAssertEqual(paths.deviceSupport.count, 4)
         XCTAssertEqual(paths.archivesDirectory.path, "/Users/tester/Library/Developer/Xcode/Archives")
         XCTAssertEqual(paths.toolchainsDirectory.path, "/Users/tester/Library/Developer/Toolchains")
-        XCTAssertEqual(paths.globalProjectCaches.map(\.path), ["/Users/tester/.cache/tuist"])
+        XCTAssertEqual(paths.globalProjectCaches.map(\.url.path), ["/Users/tester/.cache/tuist"])
         XCTAssertEqual(paths.allClearable.count, 2 + 2 + 4 + 4 + 1)
-        XCTAssertTrue(paths.previews.allSatisfy { paths.allClearable.contains($0) })
+        XCTAssertTrue(paths.previews.allSatisfy { paths.allClearable.contains($0.url) })
+    }
+
+    /// Every directory the app offers to clear names itself: the rows inside an expanded category
+    /// are the only place these titles are shown, and `.build` three times over is what the user
+    /// was looking at before.
+    func test_everyCacheDirectoryIsTitledForItself() {
+        let paths = CachePaths(home: URL(fileURLWithPath: "/Users/tester"))
+
+        XCTAssertEqual(paths.xcodeCaches.map(\.title), ["DerivedData", "Кэш Xcode"])
+        XCTAssertEqual(paths.previews.map(\.title), ["SwiftUI Previews", "Кэш документации"])
+        XCTAssertEqual(paths.deviceSupport.map(\.title), ["iOS", "watchOS", "tvOS", "visionOS"])
+        XCTAssertEqual(paths.simulatorCaches.map(\.title), [
+            "CoreSimulator, кэш образов",
+            "CoreSimulator, системный кэш",
+            "SwiftPM, кэш пакетов",
+            "Логи симуляторов",
+        ])
+        XCTAssertEqual(paths.globalProjectCaches.map(\.title), ["Общий кэш Tuist"])
+        XCTAssertEqual(paths.simulatorCaches.map(\.url.path), [
+            "/Users/tester/Library/Developer/CoreSimulator/Caches",
+            "/Users/tester/Library/Caches/com.apple.CoreSimulator",
+            "/Users/tester/Library/Caches/org.swift.swiftpm",
+            "/Users/tester/Library/Logs/CoreSimulator",
+        ])
+    }
+
+    /// The suffix shown in a project cache row comes from `projectCacheSubpaths`, so adding a
+    /// fourth subpath cannot leave a row named after a directory it does not point at.
+    func test_projectCacheNameDropsWhatTheSubpathsShare() {
+        XCTAssertEqual(
+            CachePaths.projectCacheSubpaths.map { CachePaths.projectCacheName(of: $0) },
+            ["Tuist/.build", "Derived", "DerivedData"]
+        )
     }
 
     func test_cacheItemBuilderSkipsMissingDirectories() throws {
@@ -29,7 +62,10 @@ final class CleanupModelTests: XCTestCase {
         try temp.makeFile("DerivedData/x.bin", bytes: 4096)
         let missing = temp.url.appendingPathComponent("Missing")
 
-        let items = CacheItemBuilder.items(kind: .xcodeCaches, directories: [existing, missing])
+        let items = CacheItemBuilder.items(kind: .xcodeCaches, directories: [
+            CacheDirectory(url: existing, title: "Кэш Xcode"),
+            CacheDirectory(url: missing, title: "Пропавший"),
+        ])
 
         XCTAssertEqual(items.count, 1)
         XCTAssertEqual(items[0].id, existing.path)
@@ -37,6 +73,22 @@ final class CleanupModelTests: XCTestCase {
         XCTAssertEqual(items[0].action, .clearContents(existing))
         XCTAssertFalse(items[0].isDestructive)
         XCTAssertNil(items[0].sizeBytes)
+    }
+
+    /// The row shows the name and keeps the path for the tooltip: the path alone is what made the
+    /// list unreadable, and the last component alone does not say which directory it is.
+    func test_cacheItemBuilderShowsTheTitleAndKeepsThePathAsSubtitle() throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let directory = try temp.makeDirectory("Library/Caches/com.apple.CoreSimulator")
+
+        let items = CacheItemBuilder.items(
+            kind: .simulatorCaches,
+            directories: [CacheDirectory(url: directory, title: "CoreSimulator, системный кэш")]
+        )
+
+        XCTAssertEqual(items.map(\.title), ["CoreSimulator, системный кэш"])
+        XCTAssertEqual(items.map(\.subtitle), [directory.path])
     }
 
     func test_simulatorModeDestructiveness() {
@@ -64,7 +116,9 @@ final class CleanupModelTests: XCTestCase {
 
         let items = CacheItemBuilder.items(
             kind: .xcodeCaches,
-            directories: [real, directLink, throughLink]
+            directories: [real, directLink, throughLink].map {
+                CacheDirectory(url: $0, title: $0.lastPathComponent)
+            }
         )
 
         XCTAssertEqual(items.map(\.id), [real.path])
