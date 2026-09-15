@@ -154,9 +154,12 @@ final class AppModel {
     var unmountRetryPath: String?
 
     private let runner: any CommandRunning
-    private let cachePaths: CachePaths
-    private let scanner: XcodeCleanerCore.Scanner
-    private let mountManager: ArcMountManager
+    private let defaults: UserDefaults
+    /// Rebuilt, not fixed for the lifetime of the app: all three are derived from the search roots,
+    /// and the roots are a setting the user can change while the window is open.
+    private var cachePaths: CachePaths
+    private var scanner: XcodeCleanerCore.Scanner
+    private var mountManager: ArcMountManager
     private var logFile: CleanupLogFile?
     private var hasPreselected = false
     private var nextLogID = 0
@@ -165,29 +168,60 @@ final class AppModel {
     /// instead of landing on top of a fresh scan.
     private var measureGeneration = 0
 
-    /// Where inside a mount project caches are looked for, overridable without a rebuild:
-    /// `defaults write dev.ltheresi.xcodecleaner ProjectSearchRoots -array "mobile/saft/ios"`.
+    /// Where inside a mount project caches are looked for. The settings sheet writes it; the same
+    /// key is also `defaults write dev.ltheresi.xcodecleaner ProjectSearchRoots -array …`.
     /// Read here rather than in the core, which takes the roots as a value and stays testable.
     static let projectSearchRootsKey = "ProjectSearchRoots"
 
-    /// The configured roots, or the built-in ones when nothing usable is configured. An empty or
-    /// relative-to-nowhere entry is dropped rather than honoured: `""` and `"/"` both name the
-    /// mount root, and pointing a recursive walk at the whole monorepo is exactly what this app
-    /// must never do.
+    /// The configured roots, or the built-in ones when nothing usable is configured. Every entry
+    /// goes through `CachePaths.normalizedSearchRoots`, so a list written by hand is held to the
+    /// same rules as one typed into the sheet.
     static func cachePaths(defaults: UserDefaults = .standard) -> CachePaths {
-        let configured = (defaults.stringArray(forKey: projectSearchRootsKey) ?? [])
-            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " \t/")) }
-            .filter { $0.isEmpty == false && $0.components(separatedBy: "/").contains("..") == false }
+        let configured = CachePaths.normalizedSearchRoots(
+            defaults.stringArray(forKey: projectSearchRootsKey) ?? []
+        ).roots
         return CachePaths(
             projectSearchRoots: configured.isEmpty ? CachePaths.defaultProjectSearchRoots : configured
         )
     }
 
-    init(runner: any CommandRunning = ProcessCommandRunner(), cachePaths: CachePaths = AppModel.cachePaths()) {
+    init(runner: any CommandRunning = ProcessCommandRunner(), defaults: UserDefaults = .standard) {
         self.runner = runner
+        self.defaults = defaults
+        let cachePaths = AppModel.cachePaths(defaults: defaults)
         self.cachePaths = cachePaths
         scanner = XcodeCleanerCore.Scanner(runner: runner, cachePaths: cachePaths)
         mountManager = ArcMountManager(runner: runner, home: cachePaths.home)
+    }
+
+    // MARK: Settings
+
+    /// The roots in force, which is what the settings sheet opens with: when nothing is configured
+    /// these are the built-in ones, and showing the user an empty editor instead would hide the
+    /// very thing the sheet exists to explain.
+    var projectSearchRoots: [String] { cachePaths.projectSearchRoots }
+
+    /// Saves what the user typed and puts it to work at once, without a restart.
+    ///
+    /// An empty list is a legitimate answer and means «use the built-in roots», so the key is
+    /// removed rather than written empty — that way `defaults read` shows nothing instead of
+    /// showing a list that is not the one being used.
+    ///
+    /// `cancelMeasuring` runs before anything is rebuilt: the walk started for the old roots is
+    /// still on the pool, and bumping the generation is what stops its finds from landing in the
+    /// scan that is about to replace them.
+    func applySearchRoots(_ lines: [String]) async {
+        let roots = CachePaths.normalizedSearchRoots(lines).roots
+        if roots.isEmpty {
+            defaults.removeObject(forKey: Self.projectSearchRootsKey)
+        } else {
+            defaults.set(roots, forKey: Self.projectSearchRootsKey)
+        }
+        cancelMeasuring()
+        cachePaths = Self.cachePaths(defaults: defaults)
+        scanner = XcodeCleanerCore.Scanner(runner: runner, cachePaths: cachePaths)
+        mountManager = ArcMountManager(runner: runner, home: cachePaths.home)
+        await rescan()
     }
 
     // MARK: Items

@@ -22,6 +22,11 @@ public enum RussianPlural {
         "\(count) \(form(count, "устройство", "устройства", "устройств"))"
     }
 
+    /// The project search roots, counted in the settings sheet: «1 корень», «2 корня в списке».
+    public static func searchRoots(_ count: Int) -> String {
+        "\(count) \(form(count, "корень", "корня", "корней"))"
+    }
+
     /// The genitive the «старше …» construction takes: «старше 1 дня», «старше 30 дней».
     public static func daysAfterOlderThan(_ count: Int) -> String {
         "\(count) \(form(count, "дня", "дней", "дней"))"

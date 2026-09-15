@@ -14,5 +14,9 @@ let package = Package(
             name: "XcodeCleanerCoreTests",
             dependencies: ["XcodeCleanerCore"]
         ),
+        .testTarget(
+            name: "XcodeCleanerTests",
+            dependencies: ["XcodeCleaner", "XcodeCleanerCore"]
+        ),
     ]
 )

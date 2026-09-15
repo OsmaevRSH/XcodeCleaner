@@ -27,6 +27,12 @@ final class RussianPluralTests: XCTestCase {
         XCTAssertEqual(RussianPlural.devices(22), "22 устройства")
     }
 
+    func test_searchRootsTakeTheRightForm() {
+        XCTAssertEqual(RussianPlural.searchRoots(1), "1 корень")
+        XCTAssertEqual(RussianPlural.searchRoots(2), "2 корня")
+        XCTAssertEqual(RussianPlural.searchRoots(5), "5 корней")
+    }
+
     func test_daysUseGenitiveAfterOlderThan() {
         XCTAssertEqual(RussianPlural.daysAfterOlderThan(1), "1 дня")
         XCTAssertEqual(RussianPlural.daysAfterOlderThan(30), "30 дней")

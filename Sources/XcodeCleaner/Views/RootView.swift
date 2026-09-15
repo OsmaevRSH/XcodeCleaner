@@ -4,6 +4,8 @@ import XcodeCleanerCore
 struct RootView: View {
     @Bindable var model: AppModel
 
+    @State private var isSettingsPresented = false
+
     var body: some View {
         NavigationSplitView {
             List(AppModel.Section.allCases, selection: sectionBinding) { section in
@@ -77,6 +79,18 @@ struct RootView: View {
 
     private var footer: some View {
         HStack(spacing: 10) {
+            // Disabled on the same terms as «Пересканировать»: saving starts a scan of its own, and
+            // `rescan()` declines while one is already running — which would leave the new roots
+            // set and the old ones' results on screen.
+            Button {
+                isSettingsPresented = true
+            } label: {
+                Image(systemName: "gearshape")
+            }
+            .accessibilityLabel(Text("Настройки"))
+            .help("Настройки")
+            .disabled(model.isScanning || model.isWorking)
+
             Button {
                 Task { await model.rescan() }
             } label: {
@@ -100,6 +114,19 @@ struct RootView: View {
         }
         .padding(12)
         .background(.bar)
+        // Presented from the bar rather than from the root: the confirmation sheet already hangs
+        // off the root, and two `.sheet` modifiers on one view is the arrangement where one of them
+        // quietly stops opening.
+        .sheet(isPresented: $isSettingsPresented) {
+            SettingsSheet(
+                roots: model.projectSearchRoots,
+                onSave: { lines in
+                    isSettingsPresented = false
+                    Task { await model.applySearchRoots(lines) }
+                },
+                onCancel: { isSettingsPresented = false }
+            )
+        }
     }
 
     @ViewBuilder
