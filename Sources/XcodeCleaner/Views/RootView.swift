@@ -87,6 +87,9 @@ struct RootView: View {
             if model.isWorking {
                 ProgressView().controlSize(.small)
                 Text("Выполняется…").foregroundStyle(.secondary)
+            } else if model.isDiscovering {
+                ProgressView().controlSize(.small)
+                Text("Ищу проектные кэши…").foregroundStyle(.secondary)
             } else if model.isMeasuring {
                 ProgressView().controlSize(.small)
                 Text("Считаю размеры…").foregroundStyle(.secondary)

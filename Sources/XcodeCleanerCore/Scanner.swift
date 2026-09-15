@@ -71,6 +71,52 @@ public struct Scanner: Sendable {
         return result
     }
 
+    /// Discovers project caches that `scan()` is too fast to look for, reporting each as it is
+    /// found. `swift build` leaves a `.build` next to every `Package.swift`, and no fixed list of
+    /// paths can know where those packages are — only a walk finds them, and a walk is exactly what
+    /// `scan()` must not do: bounded as it is, a cold read of one root inside a FUSE mount costs
+    /// seconds. So this runs in the background phase, next to `measureSizes(for:onSize:)`.
+    ///
+    /// Caches already in `result.projectCacheItems` are not reported again.
+    ///
+    /// - Parameter onDiscover: invoked off the main thread, once per cache, mount by mount — so the
+    ///   caches of the first mount arrive before the last mount has been walked. Cancellation is
+    ///   honoured between mounts and inside a walk; this function returning is the only signal that
+    ///   no more are coming.
+    public func discoverProjectCaches(
+        for result: ScanResult,
+        onDiscover: @escaping @Sendable (CleanupItem) -> Void
+    ) async {
+        let paths = cachePaths
+        let known = Set(result.projectCacheItems.map(\.id))
+        for mount in result.mounts where mount.mount.isMounted {
+            guard Task.isCancelled == false else { return }
+            // In a child task for the reason `measureSizes` uses them: the walk is synchronous and
+            // would otherwise block whatever thread this was called on, and a freshly created
+            // `FileManager` is owned by that task alone. Structured, so cancelling the caller
+            // reaches `Task.isCancelled` inside the walk.
+            await withTaskGroup(of: [CleanupItem].self) { group in
+                group.addTask(priority: .utility) {
+                    let fileManager = FileManager()
+                    return CacheItemBuilder.items(
+                        kind: .projectCaches,
+                        directories: ProjectCacheScanner.discoverBuildDirectories(
+                            mounts: [mount],
+                            cachePaths: paths,
+                            fileManager: fileManager
+                        ),
+                        fileManager: fileManager
+                    )
+                }
+                for await items in group {
+                    for item in items where known.contains(item.id) == false {
+                        onDiscover(item)
+                    }
+                }
+            }
+        }
+    }
+
     /// How many directory walks run at once. Each child task blocks its thread for the whole walk,
     /// so seeding one per target puts a walk on every thread of the cooperative pool and leaves
     /// nothing to run the rest of the app on. Some targets are project caches inside live FUSE
@@ -150,14 +196,24 @@ public struct Scanner: Sendable {
     /// is derived from those entries rather than from fixed directories: an archive lives in an
     /// `Archives/<day>` folder, never in the archives root, and nothing in `/Applications` becomes
     /// trashable until an Xcode was found there.
+    ///
+    /// Project caches go in from both directions. The items the result carries cover the ones found
+    /// by walking, so a `.build` discovered in the background becomes deletable by being appended
+    /// to the result and needs nothing else; the fixed subpaths go in whether or not they existed
+    /// at scan time, because Tuist can create them in between.
     public func makeDeleter(for result: ScanResult) -> SafeDeleter {
         let trashableParents = Set(
             (result.xcodes.map(\.url) + result.toolchains.map(\.url) + result.archives.map(\.url))
                 .map { $0.deletingLastPathComponent() }
         )
+        let foundProjectCaches = result.projectCacheItems.compactMap { item -> URL? in
+            guard case let .clearContents(url) = item.action else { return nil }
+            return url
+        }
         return SafeDeleter(
             clearableDirectories: cachePaths.allClearable
-                + ProjectCacheScanner.allowedDirectories(mounts: result.mounts, cachePaths: cachePaths),
+                + ProjectCacheScanner.allowedDirectories(mounts: result.mounts, cachePaths: cachePaths)
+                + foundProjectCaches,
             trashableParents: Array(trashableParents)
         )
     }

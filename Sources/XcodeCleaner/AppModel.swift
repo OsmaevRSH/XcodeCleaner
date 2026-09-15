@@ -120,6 +120,9 @@ final class AppModel {
     var isScanning = false
     var isWorking = false
     var isMeasuring = false
+    /// Whether the background walk is still finding project caches. Rows are still being added
+    /// while it is true, so no total that includes them is final yet.
+    var isDiscovering = false
     /// Sizes that arrived after the scan, keyed by `CleanupItem.id` or `ArcMountInfo.id`.
     var sizes: [String: Int64] = [:]
     var selectedItemIDs: Set<String> = []
@@ -162,7 +165,25 @@ final class AppModel {
     /// instead of landing on top of a fresh scan.
     private var measureGeneration = 0
 
-    init(runner: any CommandRunning = ProcessCommandRunner(), cachePaths: CachePaths = CachePaths()) {
+    /// Where inside a mount project caches are looked for, overridable without a rebuild:
+    /// `defaults write dev.ltheresi.xcodecleaner ProjectSearchRoots -array "mobile/saft/ios"`.
+    /// Read here rather than in the core, which takes the roots as a value and stays testable.
+    static let projectSearchRootsKey = "ProjectSearchRoots"
+
+    /// The configured roots, or the built-in ones when nothing usable is configured. An empty or
+    /// relative-to-nowhere entry is dropped rather than honoured: `""` and `"/"` both name the
+    /// mount root, and pointing a recursive walk at the whole monorepo is exactly what this app
+    /// must never do.
+    static func cachePaths(defaults: UserDefaults = .standard) -> CachePaths {
+        let configured = (defaults.stringArray(forKey: projectSearchRootsKey) ?? [])
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " \t/")) }
+            .filter { $0.isEmpty == false && $0.components(separatedBy: "/").contains("..") == false }
+        return CachePaths(
+            projectSearchRoots: configured.isEmpty ? CachePaths.defaultProjectSearchRoots : configured
+        )
+    }
+
+    init(runner: any CommandRunning = ProcessCommandRunner(), cachePaths: CachePaths = AppModel.cachePaths()) {
         self.runner = runner
         self.cachePaths = cachePaths
         scanner = XcodeCleanerCore.Scanner(runner: runner, cachePaths: cachePaths)
@@ -238,8 +259,13 @@ final class AppModel {
         items(for: kind).reduce(0) { $0 + (size(of: $1) ?? 0) }
     }
 
+    /// For project caches this also covers the discovery walk: its rows arrive one by one, and a
+    /// total with nothing pending next to it reads as the final answer while it is still growing.
     func hasPendingSizes(for kind: CleanupKind) -> Bool {
-        items(for: kind).contains { size(of: $0) == nil }
+        if kind == .projectCaches, isDiscovering {
+            return true
+        }
+        return items(for: kind).contains { size(of: $0) == nil }
     }
 
     var xcodeBytesToFree: Int64 {
@@ -360,18 +386,36 @@ final class AppModel {
         startMeasuring(scan)
     }
 
-    /// Walks everything the scan left unmeasured and feeds the numbers back in batches: a size
-    /// arrives every few hundred milliseconds for half a minute, and applying each one on its own
-    /// would rebuild the list that many times.
+    /// The whole background phase: first the walk that finds the project caches no list of fixed
+    /// paths can know about, then the sizes of everything, fed back in batches — a size arrives
+    /// every few hundred milliseconds for half a minute, and applying each one on its own would
+    /// rebuild the list that many times.
+    ///
+    /// The two run one after the other rather than at once. `measureSizes` is where the ceiling on
+    /// concurrent directory walks lives, and a discovery walk running alongside it would put one
+    /// more walk on the pool than that ceiling allows. Discovery is depth-bounded, so it costs a
+    /// fraction of what measuring the same mounts costs, and its rows appear while it runs.
     private func startMeasuring(_ result: ScanResult) {
         measureTask?.cancel()
         measureGeneration += 1
         let generation = measureGeneration
         let scanner = scanner
         isMeasuring = true
+        isDiscovering = true
         measureTask = Task { @MainActor [weak self] in
+            let (discovered, discoveries) = AsyncStream.makeStream(of: CleanupItem.self)
+            async let discovery: Void = AppModel.discover(result, scanner: scanner, into: discoveries)
+            for await item in discovered {
+                self?.append(item, generation: generation)
+            }
+            await discovery
+            self?.finishDiscovering(generation: generation)
+
+            // Measured from the list as discovery left it, so the caches it added are sized in the
+            // same pass instead of straggling in after the progress indicator is gone.
+            guard let measurable = self?.scan(ifCurrent: generation) else { return }
             let (stream, continuation) = AsyncStream.makeStream(of: SizeUpdate.self)
-            async let production: Void = AppModel.measure(result, scanner: scanner, into: continuation)
+            async let production: Void = AppModel.measure(measurable, scanner: scanner, into: continuation)
             var pending: [String: Int64] = [:]
             var lastFlush = ContinuousClock.now
             for await update in stream {
@@ -404,9 +448,38 @@ final class AppModel {
         continuation.finish()
     }
 
+    /// The discovery walk, off the main actor for the same reason as the measuring one.
+    private nonisolated static func discover(
+        _ result: ScanResult,
+        scanner: XcodeCleanerCore.Scanner,
+        into continuation: AsyncStream<CleanupItem>.Continuation
+    ) async {
+        await scanner.discoverProjectCaches(for: result) { continuation.yield($0) }
+        continuation.finish()
+    }
+
+    /// Adds a cache found after the scan to the list it belongs to — which is also what makes it
+    /// deletable, since the deleter's allowlist is derived from these items.
+    private func append(_ item: CleanupItem, generation: Int) {
+        guard generation == measureGeneration,
+              scan.projectCacheItems.contains(where: { $0.id == item.id }) == false
+        else { return }
+        scan.projectCacheItems.append(item)
+    }
+
+    /// The current scan, or nil once a newer one has taken over.
+    private func scan(ifCurrent generation: Int) -> ScanResult? {
+        generation == measureGeneration ? scan : nil
+    }
+
     private func apply(_ batch: [String: Int64], generation: Int) {
         guard generation == measureGeneration, batch.isEmpty == false else { return }
         sizes.merge(batch) { _, new in new }
+    }
+
+    private func finishDiscovering(generation: Int) {
+        guard generation == measureGeneration else { return }
+        isDiscovering = false
     }
 
     private func finishMeasuring(generation: Int) {
@@ -419,6 +492,7 @@ final class AppModel {
         measureTask = nil
         measureGeneration += 1
         isMeasuring = false
+        isDiscovering = false
     }
 
     // MARK: Cleanup

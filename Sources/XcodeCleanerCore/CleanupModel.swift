@@ -146,20 +146,31 @@ public struct CacheDirectory: Sendable, Hashable {
 public struct CachePaths: Sendable {
     public let home: URL
     public let applicationsDirectory: URL
+    /// Where inside an Arcadia mount the projects live. Everything about project caches — the fixed
+    /// Tuist outputs and the `.build` directories the walk looks for — is confined to these, because
+    /// a mount is the whole monorepo and walking all of it is not something a cleanup tool may do.
+    public let projectSearchRoots: [String]
 
     public init(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
-        applicationsDirectory: URL = URL(fileURLWithPath: "/Applications")
+        applicationsDirectory: URL = URL(fileURLWithPath: "/Applications"),
+        projectSearchRoots: [String] = CachePaths.defaultProjectSearchRoots
     ) {
         self.home = home.standardizedFileURL
         self.applicationsDirectory = applicationsDirectory.standardizedFileURL
+        self.projectSearchRoots = projectSearchRoots
     }
 
-    public static let projectCacheSubpaths = [
-        "mobile/saft/ios/Tuist/.build",
-        "mobile/saft/ios/Derived",
-        "mobile/saft/ios/DerivedData",
-    ]
+    public static let defaultProjectSearchRoots = ["mobile/saft/ios", "mobile/music/ios"]
+
+    /// The project caches that sit at a known place: Tuist writes both next to the project, and
+    /// either may be missing at the moment of a scan and appear before the cleanup runs — so they
+    /// are offered by path rather than found. `.build` is deliberately absent: `swift build` leaves
+    /// one next to every `Package.swift`, and only `ProjectCacheScanner.discoverBuildDirectories`
+    /// knows where those are.
+    public var projectCacheSubpaths: [String] {
+        projectSearchRoots.flatMap { ["\($0)/Derived", "\($0)/DerivedData"] }
+    }
 
     private func library(_ path: String) -> URL {
         home.appendingPathComponent("Library").appendingPathComponent(path)
@@ -213,36 +224,17 @@ public struct CachePaths: Sendable {
         (xcodeCaches + previews + deviceSupport + simulatorCaches + globalProjectCaches).map(\.url)
     }
 
-    /// The project caches inside one mount, each titled with the mount's own folder name: every
-    /// mount contributes the same three subpaths, and only the mount tells them apart.
+    /// The project caches inside one mount, each titled with the mount's own folder name followed
+    /// by the path inside it: every mount contributes the same subpaths, only the mount tells them
+    /// apart, and the same naming carries the discovered `.build` directories.
     public func projectCaches(inMount mount: URL, mountName: String) -> [CacheDirectory] {
-        Self.projectCacheSubpaths.map { subpath in
+        projectCacheSubpaths.map { subpath in
             CacheDirectory(
                 url: mount.appendingPathComponent(subpath),
-                title: "\(mountName) · \(Self.projectCacheName(of: subpath))"
+                title: "\(mountName) · \(subpath)"
             )
         }
     }
-
-    /// What distinguishes one project cache from another inside the same mount: the subpaths all
-    /// live in the same project directory, and repeating that directory in every row says nothing.
-    static func projectCacheName(of subpath: String) -> String {
-        subpath.components(separatedBy: "/")
-            .dropFirst(sharedProjectCacheDepth)
-            .joined(separator: "/")
-    }
-
-    /// How many leading components every project subpath has in common — never a whole subpath,
-    /// because something has to survive for the row to have a name at all.
-    private static let sharedProjectCacheDepth: Int = {
-        let split = projectCacheSubpaths.map { $0.components(separatedBy: "/") }
-        guard let first = split.first, let shortest = split.map(\.count).min() else { return 0 }
-        var depth = 0
-        while depth < shortest - 1, split.allSatisfy({ $0[depth] == first[depth] }) {
-            depth += 1
-        }
-        return depth
-    }()
 }
 
 public enum CacheItemBuilder {

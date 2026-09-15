@@ -146,8 +146,9 @@ final class ScannerTests: XCTestCase {
             try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
         }
         let mounts = ["arcadia", "arcadia_TASK-1"].map { temp.url.appendingPathComponent($0) }
+        let subpaths = CachePaths(home: temp.url).projectCacheSubpaths
         for mount in mounts {
-            for subpath in CachePaths.projectCacheSubpaths {
+            for subpath in subpaths {
                 try temp.makeDirectory("\(mount.lastPathComponent)/\(subpath)")
             }
         }
@@ -167,7 +168,7 @@ final class ScannerTests: XCTestCase {
         let result = await scanner.scan()
 
         let items = result.cacheItems + result.projectCacheItems
-        XCTAssertEqual(items.count, clearable.count + 2 * CachePaths.projectCacheSubpaths.count)
+        XCTAssertEqual(items.count, clearable.count + 2 * subpaths.count)
         for (kind, ofKind) in Dictionary(grouping: items, by: \.kind) {
             XCTAssertEqual(
                 Set(ofKind.map(\.title)).count,
@@ -176,6 +177,70 @@ final class ScannerTests: XCTestCase {
             )
             XCTAssertTrue(ofKind.allSatisfy { $0.title.isEmpty == false }, "\(kind) has a nameless row")
         }
+    }
+
+    /// The second phase: `scan()` offers the fixed paths, and the walk that follows adds every
+    /// `.build` somebody left behind with `swift build`. The fixed rows must not be reported twice.
+    func test_discoverProjectCachesAddsTheBuildDirectoriesScanCannotKnowAbout() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let applications = try temp.makeDirectory("Applications")
+        let mount = try temp.makeDirectory("arcadia")
+        try temp.makeDirectory("arcadia/mobile/saft/ios/Derived")
+        try temp.makeFile("arcadia/mobile/saft/ios/Tools/SaftCITool/.build/x", bytes: 10)
+        try temp.makeFile("arcadia/mobile/music/ios/modules/Maple/.build/x", bytes: 10)
+        let runner = FakeCommandRunner()
+        runner.respond(
+            to: "arc mount --list --json",
+            stdout: #"[{"status":"mounted","mount":"\#(mount.path)","store":"\#(mount.path)/s","object-store":"\#(mount.path)/o"}]"#
+        )
+        runner.respond(to: "xcode-select -p", stdout: "/none\n")
+        runner.respond(to: "xcrun simctl list devices -j", stdout: #"{"devices":{}}"#)
+        runner.respond(to: "xcrun simctl runtime list -j", stdout: "{}")
+        let scanner = XcodeCleanerCore.Scanner(
+            runner: runner,
+            cachePaths: CachePaths(home: temp.url, applicationsDirectory: applications)
+        )
+        let result = await scanner.scan()
+        let collector = ItemCollector()
+
+        await scanner.discoverProjectCaches(for: result) { collector.record($0) }
+
+        XCTAssertEqual(collector.items.map(\.id), [
+            mount.appendingPathComponent("mobile/music/ios/modules/Maple/.build").path,
+            mount.appendingPathComponent("mobile/saft/ios/Tools/SaftCITool/.build").path,
+        ])
+        XCTAssertTrue(collector.items.allSatisfy { $0.kind == .projectCaches && $0.sizeBytes == nil })
+        XCTAssertEqual(collector.items.map(\.title), [
+            "arcadia · mobile/music/ios/modules/Maple/.build",
+            "arcadia · mobile/saft/ios/Tools/SaftCITool/.build",
+        ])
+        XCTAssertFalse(collector.items.contains { result.projectCacheItems.map(\.id).contains($0.id) })
+    }
+
+    /// A cache found in the background is deletable: the allowlist is derived from the items the
+    /// result carries, so appending to it is all the discovery has to do.
+    func test_makeDeleterAllowsADiscoveredBuildDirectory() {
+        let paths = CachePaths(home: URL(fileURLWithPath: "/Users/tester"))
+        let scanner = XcodeCleanerCore.Scanner(runner: FakeCommandRunner(), cachePaths: paths)
+        let discovered = URL(fileURLWithPath: "/Users/tester/arcadia/mobile/saft/ios/Tools/SaftCITool/.build")
+        var result = ScanResult()
+        result.projectCacheItems = [
+            CleanupItem(
+                id: discovered.path,
+                kind: .projectCaches,
+                title: "arcadia · mobile/saft/ios/Tools/SaftCITool/.build",
+                subtitle: discovered.path,
+                action: .clearContents(discovered),
+                sizeBytes: nil,
+                isDestructive: false
+            ),
+        ]
+
+        let deleter = scanner.makeDeleter(for: result)
+
+        XCTAssertTrue(deleter.clearableDirectories.contains(discovered.path))
+        XCTAssertTrue(deleter.clearableDirectories.contains(paths.xcodeCaches[0].url.path))
     }
 
     func test_cancelledMeasureSizesReturnsWithoutReportingEverything() async throws {

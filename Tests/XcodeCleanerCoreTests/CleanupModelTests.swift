@@ -46,12 +46,32 @@ final class CleanupModelTests: XCTestCase {
         ])
     }
 
-    /// The suffix shown in a project cache row comes from `projectCacheSubpaths`, so adding a
-    /// fourth subpath cannot leave a row named after a directory it does not point at.
-    func test_projectCacheNameDropsWhatTheSubpathsShare() {
+    /// The fixed project caches are Tuist's two outputs under every configured root, and nothing
+    /// else: `.build` directories are found by walking, not listed here.
+    func test_projectCacheSubpathsAreTuistOutputsUnderEveryRoot() {
+        let paths = CachePaths(home: URL(fileURLWithPath: "/Users/tester"))
+
+        XCTAssertEqual(CachePaths.defaultProjectSearchRoots, ["mobile/saft/ios", "mobile/music/ios"])
+        XCTAssertEqual(paths.projectSearchRoots, CachePaths.defaultProjectSearchRoots)
+        XCTAssertEqual(paths.projectCacheSubpaths, [
+            "mobile/saft/ios/Derived",
+            "mobile/saft/ios/DerivedData",
+            "mobile/music/ios/Derived",
+            "mobile/music/ios/DerivedData",
+        ])
+    }
+
+    func test_customSearchRootsReplaceTheDefaultOnes() {
+        let paths = CachePaths(
+            home: URL(fileURLWithPath: "/Users/tester"),
+            projectSearchRoots: ["tools/cli"]
+        )
+
+        XCTAssertEqual(paths.projectCacheSubpaths, ["tools/cli/Derived", "tools/cli/DerivedData"])
         XCTAssertEqual(
-            CachePaths.projectCacheSubpaths.map { CachePaths.projectCacheName(of: $0) },
-            ["Tuist/.build", "Derived", "DerivedData"]
+            paths.projectCaches(inMount: URL(fileURLWithPath: "/Users/tester/arcadia"), mountName: "arcadia")
+                .map(\.title),
+            ["arcadia · tools/cli/Derived", "arcadia · tools/cli/DerivedData"]
         )
     }
 

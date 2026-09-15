@@ -263,7 +263,7 @@ final class CleanerTests: XCTestCase {
         XCTAssertTrue(deleter.trashableParents.contains(paths.archivesDirectory.appendingPathComponent("2026-09-08").path))
         XCTAssertFalse(deleter.trashableParents.contains(paths.archivesDirectory.path))
 
-        for subpath in CachePaths.projectCacheSubpaths {
+        for subpath in paths.projectCacheSubpaths {
             XCTAssertTrue(deleter.clearableDirectories.contains("/Users/tester/arcadia/\(subpath)"))
         }
         XCTAssertFalse(deleter.clearableDirectories.contains { $0.hasPrefix("/Users/tester/arcadia_old") })
