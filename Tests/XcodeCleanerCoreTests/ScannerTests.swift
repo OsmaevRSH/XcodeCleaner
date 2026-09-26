@@ -187,8 +187,10 @@ final class ScannerTests: XCTestCase {
         let applications = try temp.makeDirectory("Applications")
         let mount = try temp.makeDirectory("arcadia")
         try temp.makeDirectory("arcadia/mobile/saft/ios/Derived")
-        try temp.makeFile("arcadia/mobile/saft/ios/Tools/SaftCITool/.build/x", bytes: 10)
-        try temp.makeFile("arcadia/mobile/music/ios/modules/Maple/.build/x", bytes: 10)
+        for package in ["arcadia/mobile/saft/ios/Tools/SaftCITool", "arcadia/mobile/music/ios/modules/Maple"] {
+            try temp.makeFile("\(package)/Package.swift", bytes: 10)
+            try temp.makeFile("\(package)/.build/x", bytes: 10)
+        }
         let runner = FakeCommandRunner()
         runner.respond(
             to: "arc mount --list --json",
@@ -241,6 +243,154 @@ final class ScannerTests: XCTestCase {
 
         XCTAssertTrue(deleter.clearableDirectories.contains(discovered.path))
         XCTAssertTrue(deleter.clearableDirectories.contains(paths.xcodeCaches[0].url.path))
+    }
+
+    /// A runner on a machine without Arcadia: `arc` is not there, and nothing else is needed.
+    private func runnerWithoutArc() -> FakeCommandRunner {
+        let runner = FakeCommandRunner()
+        runner.respond(to: "arc mount --list --json", stderr: "arc: command not found", exitCode: 127)
+        runner.respond(to: "xcode-select -p", stdout: "/none\n")
+        runner.respond(to: "xcrun simctl list devices -j", stdout: #"{"devices":{}}"#)
+        runner.respond(to: "xcrun simctl runtime list -j", stdout: "{}")
+        return runner
+    }
+
+    /// This is what makes the app useful on a machine without Arcadia: the folders are walked on
+    /// their own, with no mount in the result and `arc` failing outright.
+    func test_discoverProjectCachesSearchesFoldersWithoutAnyMount() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let applications = try temp.makeDirectory("Applications")
+        let developer = try temp.makeDirectory("Developer")
+        try temp.makeFile("Developer/MyLib/Package.swift", bytes: 10)
+        try temp.makeFile("Developer/MyLib/.build/x", bytes: 10)
+        let scanner = XcodeCleanerCore.Scanner(
+            runner: runnerWithoutArc(),
+            cachePaths: CachePaths(
+                home: temp.url,
+                applicationsDirectory: applications,
+                projectSearchFolders: [developer]
+            )
+        )
+        let result = await scanner.scan()
+        let collector = ItemCollector()
+
+        await scanner.discoverProjectCaches(for: result) { collector.record($0) }
+
+        XCTAssertEqual(result.mounts, [])
+        XCTAssertEqual(collector.items.map(\.id), [developer.appendingPathComponent("MyLib/.build").path])
+        XCTAssertEqual(collector.items.map(\.title), ["~/Developer/MyLib/.build"])
+        XCTAssertEqual(collector.items.map(\.subtitle), [developer.appendingPathComponent("MyLib/.build").path])
+        XCTAssertTrue(collector.items.allSatisfy { $0.kind == .projectCaches && $0.sizeBytes == nil })
+    }
+
+    /// A folder that reaches a `.build` a mount root already reported does not report it again.
+    func test_discoverProjectCachesReportsACacheReachableTwiceOnce() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let applications = try temp.makeDirectory("Applications")
+        let mount = try temp.makeDirectory("arcadia")
+        try temp.makeFile("arcadia/mobile/saft/ios/Tools/Package.swift", bytes: 10)
+        try temp.makeFile("arcadia/mobile/saft/ios/Tools/.build/x", bytes: 10)
+        let runner = runnerWithoutArc()
+        runner.respond(
+            to: "arc mount --list --json",
+            stdout: #"[{"status":"mounted","mount":"\#(mount.path)","store":"\#(mount.path)/s","object-store":"\#(mount.path)/o"}]"#
+        )
+        let scanner = XcodeCleanerCore.Scanner(
+            runner: runner,
+            cachePaths: CachePaths(
+                home: temp.url,
+                applicationsDirectory: applications,
+                projectSearchFolders: [mount.appendingPathComponent("mobile")]
+            )
+        )
+        let result = await scanner.scan()
+        let collector = ItemCollector()
+
+        await scanner.discoverProjectCaches(for: result) { collector.record($0) }
+
+        XCTAssertEqual(collector.items.map(\.title), ["arcadia · mobile/saft/ios/Tools/.build"])
+    }
+
+    /// The folder stays in the settings — it may be on a drive that is not plugged in — but the
+    /// scan says it was skipped instead of silently finding nothing there.
+    func test_scanWarnsAboutAFolderThatDoesNotExist() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let applications = try temp.makeDirectory("Applications")
+        let missing = temp.url.appendingPathComponent("Unplugged/Projects")
+        let scanner = XcodeCleanerCore.Scanner(
+            runner: runnerWithoutArc(),
+            cachePaths: CachePaths(home: temp.url, applicationsDirectory: applications, projectSearchFolders: [missing])
+        )
+
+        let result = await scanner.scan()
+
+        XCTAssertTrue(result.warnings.contains("Папка для поиска не найдена, пропущена: ~/Unplugged/Projects"))
+    }
+
+    func test_scanWarnsAboutAFolderReachedThroughASymlink() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let applications = try temp.makeDirectory("Applications")
+        let real = try temp.makeDirectory("real")
+        let link = try temp.makeSymlink("link", to: real)
+        let scanner = XcodeCleanerCore.Scanner(
+            runner: runnerWithoutArc(),
+            cachePaths: CachePaths(home: temp.url, applicationsDirectory: applications, projectSearchFolders: [link])
+        )
+
+        let result = await scanner.scan()
+
+        XCTAssertTrue(result.warnings.contains("Пропущено, путь проходит через симлинк: \(link.path)"))
+    }
+
+    /// The walk that ran out of time says so in the log, and says which folder to narrow down.
+    func test_discoverProjectCachesForwardsTheTimeBudgetWarning() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let applications = try temp.makeDirectory("Applications")
+        let developer = try temp.makeDirectory("Developer")
+        let scanner = XcodeCleanerCore.Scanner(
+            runner: runnerWithoutArc(),
+            cachePaths: CachePaths(home: temp.url, applicationsDirectory: applications, projectSearchFolders: [developer]),
+            discoveryTimeBudget: .zero
+        )
+        let result = await scanner.scan()
+        let warnings = LineCollector()
+
+        await scanner.discoverProjectCaches(for: result, onDiscover: { _ in }, onWarning: { warnings.append($0) })
+
+        XCTAssertEqual(warnings.lines, ["Поиск в ~/Developer остановлен через 0 с — укажите папку точнее"])
+    }
+
+    /// The deleter's allowlist is derived from the items the result carries, so a cache found in a
+    /// folder is deletable the moment it is appended — exactly like one found in a mount.
+    func test_makeDeleterAllowsABuildDirectoryDiscoveredInAFolder() async throws {
+        let temp = try TemporaryDirectory()
+        defer { temp.remove() }
+        let applications = try temp.makeDirectory("Applications")
+        let developer = try temp.makeDirectory("Developer")
+        try temp.makeFile("Developer/MyLib/Package.swift", bytes: 10)
+        try temp.makeFile("Developer/MyLib/.build/x", bytes: 10)
+        let scanner = XcodeCleanerCore.Scanner(
+            runner: runnerWithoutArc(),
+            cachePaths: CachePaths(home: temp.url, applicationsDirectory: applications, projectSearchFolders: [developer])
+        )
+        var result = await scanner.scan()
+        let collector = ItemCollector()
+        await scanner.discoverProjectCaches(for: result) { collector.record($0) }
+        let build = developer.appendingPathComponent("MyLib/.build")
+        XCTAssertFalse(scanner.makeDeleter(for: result).clearableDirectories.contains(build.path))
+
+        result.projectCacheItems += collector.items
+        let deleter = scanner.makeDeleter(for: result)
+
+        XCTAssertTrue(deleter.clearableDirectories.contains(build.path))
+        XCTAssertEqual(try deleter.clearContents(of: build), [])
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: build.path), [])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: developer.appendingPathComponent("MyLib/Package.swift").path))
     }
 
     func test_cancelledMeasureSizesReturnsWithoutReportingEverything() async throws {

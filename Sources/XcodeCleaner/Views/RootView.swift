@@ -120,9 +120,11 @@ struct RootView: View {
         .sheet(isPresented: $isSettingsPresented) {
             SettingsSheet(
                 roots: model.projectSearchRoots,
-                onSave: { lines in
+                folders: model.projectSearchFolders,
+                home: model.home,
+                onSave: { roots, folders in
                     isSettingsPresented = false
-                    Task { await model.applySearchRoots(lines) }
+                    Task { await model.applySearchSettings(roots: roots, folders: folders) }
                 },
                 onCancel: { isSettingsPresented = false }
             )

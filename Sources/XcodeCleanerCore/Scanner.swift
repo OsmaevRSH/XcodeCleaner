@@ -20,11 +20,20 @@ public struct Scanner: Sendable {
     // Any injected `FileManager` must be thread-safe (the shared default instance is); it is only
     // read.
     private nonisolated(unsafe) let fileManager: FileManager
+    /// Per root; see `ProjectCacheScanner.defaultTimeBudget`. Injectable so a test can watch a
+    /// root run out of time without waiting thirty seconds for it.
+    private let discoveryTimeBudget: Duration
 
-    public init(runner: any CommandRunning, cachePaths: CachePaths, fileManager: FileManager = .default) {
+    public init(
+        runner: any CommandRunning,
+        cachePaths: CachePaths,
+        fileManager: FileManager = .default,
+        discoveryTimeBudget: Duration = ProjectCacheScanner.defaultTimeBudget
+    ) {
         self.runner = runner
         self.cachePaths = cachePaths
         self.fileManager = fileManager
+        self.discoveryTimeBudget = discoveryTimeBudget
     }
 
     /// Finds everything there is to clean without measuring any of it: no branch of this call
@@ -67,7 +76,8 @@ public struct Scanner: Sendable {
         result.projectCacheItems = await projectItems
 
         result.warnings = [simulatorWarning, xcodeWarning, mountWarning].compactMap { $0 }
-            + symlinkWarnings(projectDirectories: projectDirectories.map(\.url))
+            + symlinkWarnings(projectDirectories: projectDirectories.map(\.url) + paths.projectSearchFolders)
+            + missingFolderWarnings()
         return result
     }
 
@@ -77,43 +87,79 @@ public struct Scanner: Sendable {
     /// `scan()` must not do: bounded as it is, a cold read of one root inside a FUSE mount costs
     /// seconds. So this runs in the background phase, next to `measureSizes(for:onSize:)`.
     ///
-    /// Caches already in `result.projectCacheItems` are not reported again.
+    /// The mounted mounts are walked first, then the folders from `projectSearchFolders`. The
+    /// folders do not depend on the mounts at all: with `arc` missing and no mount in the result,
+    /// they are still walked.
     ///
-    /// - Parameter onDiscover: invoked off the main thread, once per cache, mount by mount — so the
-    ///   caches of the first mount arrive before the last mount has been walked. Cancellation is
-    ///   honoured between mounts and inside a walk; this function returning is the only signal that
-    ///   no more are coming.
+    /// Caches already in `result.projectCacheItems` are not reported again, and neither is a cache
+    /// reachable from two places — a folder inside a mount root, or two nested folders. The first
+    /// report wins, so a `.build` inside a mount keeps the mount's name.
+    ///
+    /// - Parameters:
+    ///   - onDiscover: invoked off the main thread, once per cache, root by root — so the caches of
+    ///     the first mount arrive before the last folder has been walked. Cancellation is honoured
+    ///     between roots and inside a walk; this function returning is the only signal that no
+    ///     more are coming.
+    ///   - onWarning: invoked off the main thread for each root that ran out of time, with the line
+    ///     the log should show.
     public func discoverProjectCaches(
         for result: ScanResult,
-        onDiscover: @escaping @Sendable (CleanupItem) -> Void
+        onDiscover: @escaping @Sendable (CleanupItem) -> Void,
+        onWarning: @escaping @Sendable (String) -> Void = { _ in }
     ) async {
         let paths = cachePaths
-        let known = Set(result.projectCacheItems.map(\.id))
+        let budget = discoveryTimeBudget
+        var reported = Set(result.projectCacheItems.map(\.id))
+        var walks: [@Sendable (FileManager) -> ProjectCacheScanner.Discovery] = []
         for mount in result.mounts where mount.mount.isMounted {
-            guard Task.isCancelled == false else { return }
-            // In a child task for the reason `measureSizes` uses them: the walk is synchronous and
-            // would otherwise block whatever thread this was called on, and a freshly created
-            // `FileManager` is owned by that task alone. Structured, so cancelling the caller
-            // reaches `Task.isCancelled` inside the walk.
-            await withTaskGroup(of: [CleanupItem].self) { group in
-                group.addTask(priority: .utility) {
-                    let fileManager = FileManager()
-                    return CacheItemBuilder.items(
-                        kind: .projectCaches,
-                        directories: ProjectCacheScanner.discoverBuildDirectories(
-                            mounts: [mount],
-                            cachePaths: paths,
-                            fileManager: fileManager
-                        ),
-                        fileManager: fileManager
-                    )
-                }
-                for await items in group {
-                    for item in items where known.contains(item.id) == false {
-                        onDiscover(item)
-                    }
-                }
+            walks.append { fileManager in
+                ProjectCacheScanner.discoverBuildDirectories(
+                    mounts: [mount],
+                    cachePaths: paths,
+                    timeBudget: budget,
+                    fileManager: fileManager
+                )
             }
+        }
+        for folder in paths.projectSearchFolders {
+            walks.append { fileManager in
+                ProjectCacheScanner.discoverBuildDirectories(
+                    inFolders: [folder],
+                    home: paths.home,
+                    timeBudget: budget,
+                    fileManager: fileManager
+                )
+            }
+        }
+        for walk in walks {
+            guard Task.isCancelled == false else { return }
+            let (items, warnings) = await Self.run(walk)
+            for item in items where reported.insert(item.id).inserted {
+                onDiscover(item)
+            }
+            warnings.forEach(onWarning)
+        }
+    }
+
+    /// One discovery walk, in a child task for the reason `measureSizes` uses them: the walk is
+    /// synchronous and would otherwise block whatever thread this was called on, and a freshly
+    /// created `FileManager` is owned by that task alone. Structured, so cancelling the caller
+    /// reaches `Task.isCancelled` inside the walk.
+    private static func run(
+        _ walk: @escaping @Sendable (FileManager) -> ProjectCacheScanner.Discovery
+    ) async -> ([CleanupItem], [String]) {
+        await withTaskGroup(of: ([CleanupItem], [String]).self) { group in
+            group.addTask(priority: .utility) {
+                let fileManager = FileManager()
+                let discovery = walk(fileManager)
+                let items = CacheItemBuilder.items(
+                    kind: .projectCaches,
+                    directories: discovery.directories,
+                    fileManager: fileManager
+                )
+                return (items, discovery.warnings)
+            }
+            return await group.next() ?? ([], [])
         }
     }
 
@@ -218,8 +264,22 @@ public struct Scanner: Sendable {
         )
     }
 
+    /// A search folder that is not there — a drive not plugged in, a project moved away — stays in
+    /// the settings and is skipped, and the log says so rather than leaving the user to wonder why
+    /// nothing turned up in it.
+    private func missingFolderWarnings() -> [String] {
+        cachePaths.projectSearchFolders.compactMap { folder in
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: folder.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                return "Папка для поиска не найдена, пропущена: \(cachePaths.displayPath(folder))"
+            }
+            return nil
+        }
+    }
+
     /// The directories the item builders silently drop because they sit on or behind a symlink,
-    /// reported once each even though the global project caches appear in both lists.
+    /// reported once each even though the global project caches appear in both lists. The search
+    /// folders go through here too: the walk refuses one reached through a symlink.
     private func symlinkWarnings(projectDirectories: [URL]) -> [String] {
         let skipped = CacheItemBuilder.symlinkedDirectories(cachePaths.allClearable, fileManager: fileManager)
             + CacheItemBuilder.symlinkedDirectories(projectDirectories, fileManager: fileManager)

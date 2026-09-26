@@ -80,4 +80,76 @@ final class AppModelSearchRootsTests: XCTestCase {
             CachePaths.defaultProjectSearchRoots
         )
     }
+
+    // MARK: Folders
+
+    private var home: URL { FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL }
+
+    func test_readsConfiguredFolders() {
+        defaults.set(["~/Developer", "/Volumes/Work/"], forKey: AppModel.projectSearchFoldersKey)
+
+        XCTAssertEqual(
+            AppModel.cachePaths(defaults: defaults).projectSearchFolders.map(\.path),
+            [home.appendingPathComponent("Developer").path, "/Volumes/Work"]
+        )
+    }
+
+    func test_dropsRejectedFolders() {
+        defaults.set(
+            ["/", "Developer", "/System", "~/Developer", "~/Developer/"],
+            forKey: AppModel.projectSearchFoldersKey
+        )
+
+        XCTAssertEqual(
+            AppModel.cachePaths(defaults: defaults).projectSearchFolders.map(\.path),
+            [home.appendingPathComponent("Developer").path]
+        )
+    }
+
+    func test_foldersFallBackToEmptyWhenKeyIsAbsent() {
+        XCTAssertEqual(AppModel.cachePaths(defaults: defaults).projectSearchFolders, [])
+    }
+
+    func test_foldersFallBackToEmptyWhenValueIsNotAListOfStrings() {
+        defaults.set("~/Developer", forKey: AppModel.projectSearchFoldersKey)
+        XCTAssertEqual(AppModel.cachePaths(defaults: defaults).projectSearchFolders, [])
+
+        defaults.set([1, 2], forKey: AppModel.projectSearchFoldersKey)
+        XCTAssertEqual(AppModel.cachePaths(defaults: defaults).projectSearchFolders, [])
+    }
+
+    func test_foldersFallBackToEmptyWhenEveryFolderIsRejected() {
+        defaults.set(["/", "relative", "/usr"], forKey: AppModel.projectSearchFoldersKey)
+
+        XCTAssertEqual(AppModel.cachePaths(defaults: defaults).projectSearchFolders, [])
+    }
+
+    /// The two lists are independent: folders never replace the Arcadia roots or their defaults.
+    func test_foldersLeaveTheRootsAlone() {
+        defaults.set(["~/Developer"], forKey: AppModel.projectSearchFoldersKey)
+
+        XCTAssertEqual(
+            AppModel.cachePaths(defaults: defaults).projectSearchRoots,
+            CachePaths.defaultProjectSearchRoots
+        )
+    }
+
+    func test_storingWritesNormalizedListsAndRemovesEmptyOnes() {
+        AppModel.storeSearchSettings(
+            roots: [" /tools/cli/ "],
+            folders: ["~/Developer/", "/", "~/Developer"],
+            in: defaults
+        )
+
+        XCTAssertEqual(defaults.stringArray(forKey: AppModel.projectSearchRootsKey), ["tools/cli"])
+        XCTAssertEqual(
+            defaults.stringArray(forKey: AppModel.projectSearchFoldersKey),
+            [home.appendingPathComponent("Developer").path]
+        )
+
+        AppModel.storeSearchSettings(roots: [], folders: [], in: defaults)
+
+        XCTAssertNil(defaults.object(forKey: AppModel.projectSearchRootsKey))
+        XCTAssertNil(defaults.object(forKey: AppModel.projectSearchFoldersKey))
+    }
 }

@@ -65,6 +65,12 @@ private struct SizeUpdate: Sendable {
     let bytes: Int64
 }
 
+/// What the discovery walk hands the main actor: a cache it found, or a root it gave up on.
+private enum DiscoveryEvent: Sendable {
+    case item(CleanupItem)
+    case warning(String)
+}
+
 /// A log line with an identity of its own. The text repeats — «  simctl delete unavailable» looks
 /// the same every run — so `ForEach` cannot key on it, and keying on the index means rebuilding an
 /// array of every line on every append.
@@ -155,8 +161,8 @@ final class AppModel {
 
     private let runner: any CommandRunning
     private let defaults: UserDefaults
-    /// Rebuilt, not fixed for the lifetime of the app: all three are derived from the search roots,
-    /// and the roots are a setting the user can change while the window is open.
+    /// Rebuilt, not fixed for the lifetime of the app: all three are derived from the search roots
+    /// and folders, and those are settings the user can change while the window is open.
     private var cachePaths: CachePaths
     private var scanner: XcodeCleanerCore.Scanner
     private var mountManager: ArcMountManager
@@ -173,16 +179,45 @@ final class AppModel {
     /// Read here rather than in the core, which takes the roots as a value and stays testable.
     static let projectSearchRootsKey = "ProjectSearchRoots"
 
-    /// The configured roots, or the built-in ones when nothing usable is configured. Every entry
-    /// goes through `CachePaths.normalizedSearchRoots`, so a list written by hand is held to the
-    /// same rules as one typed into the sheet.
+    /// Absolute folders searched outside the mounts. The settings sheet writes it; the same key is
+    /// also `defaults write dev.ltheresi.xcodecleaner ProjectSearchFolders -array …`.
+    static let projectSearchFoldersKey = "ProjectSearchFolders"
+
+    /// The configured roots, or the built-in ones when nothing usable is configured, plus the
+    /// configured folders, or none. Every entry goes through `CachePaths.normalizedSearchRoots` or
+    /// `normalizedSearchFolders`, so a list written by hand is held to the same rules as one made in
+    /// the sheet. Folders have no built-in fallback: walking some folder the user never picked is
+    /// not a default a cleanup tool gets to have.
     static func cachePaths(defaults: UserDefaults = .standard) -> CachePaths {
         let configured = CachePaths.normalizedSearchRoots(
             defaults.stringArray(forKey: projectSearchRootsKey) ?? []
         ).roots
+        let folders = CachePaths.normalizedSearchFolders(
+            defaults.stringArray(forKey: projectSearchFoldersKey) ?? []
+        ).folders
         return CachePaths(
-            projectSearchRoots: configured.isEmpty ? CachePaths.defaultProjectSearchRoots : configured
+            projectSearchRoots: configured.isEmpty ? CachePaths.defaultProjectSearchRoots : configured,
+            projectSearchFolders: folders
         )
+    }
+
+    /// Writes both lists the way `cachePaths(defaults:)` reads them back: normalized, and removed
+    /// rather than written empty. An empty root list means «use the built-in roots» and an empty
+    /// folder list means «no folders»; either way `defaults read` then shows nothing instead of a
+    /// list that is not the one being used.
+    static func storeSearchSettings(roots: [String], folders: [String], in defaults: UserDefaults) {
+        let roots = CachePaths.normalizedSearchRoots(roots).roots
+        if roots.isEmpty {
+            defaults.removeObject(forKey: projectSearchRootsKey)
+        } else {
+            defaults.set(roots, forKey: projectSearchRootsKey)
+        }
+        let folders = CachePaths.normalizedSearchFolders(folders).folders.map(\.path)
+        if folders.isEmpty {
+            defaults.removeObject(forKey: projectSearchFoldersKey)
+        } else {
+            defaults.set(folders, forKey: projectSearchFoldersKey)
+        }
     }
 
     init(runner: any CommandRunning = ProcessCommandRunner(), defaults: UserDefaults = .standard) {
@@ -201,22 +236,19 @@ final class AppModel {
     /// very thing the sheet exists to explain.
     var projectSearchRoots: [String] { cachePaths.projectSearchRoots }
 
-    /// Saves what the user typed and puts it to work at once, without a restart.
-    ///
-    /// An empty list is a legitimate answer and means «use the built-in roots», so the key is
-    /// removed rather than written empty — that way `defaults read` shows nothing instead of
-    /// showing a list that is not the one being used.
+    /// The folders in force, already normalized; the sheet shows them with the home as `~`.
+    var projectSearchFolders: [URL] { cachePaths.projectSearchFolders }
+
+    var home: URL { cachePaths.home }
+
+    /// Saves what the sheet holds and puts it to work at once, without a restart. How each list is
+    /// stored is `storeSearchSettings(roots:folders:in:)`.
     ///
     /// `cancelMeasuring` runs before anything is rebuilt: the walk started for the old roots is
     /// still on the pool, and bumping the generation is what stops its finds from landing in the
     /// scan that is about to replace them.
-    func applySearchRoots(_ lines: [String]) async {
-        let roots = CachePaths.normalizedSearchRoots(lines).roots
-        if roots.isEmpty {
-            defaults.removeObject(forKey: Self.projectSearchRootsKey)
-        } else {
-            defaults.set(roots, forKey: Self.projectSearchRootsKey)
-        }
+    func applySearchSettings(roots: [String], folders: [String]) async {
+        Self.storeSearchSettings(roots: roots, folders: folders, in: defaults)
         cancelMeasuring()
         cachePaths = Self.cachePaths(defaults: defaults)
         scanner = XcodeCleanerCore.Scanner(runner: runner, cachePaths: cachePaths)
@@ -437,10 +469,13 @@ final class AppModel {
         isMeasuring = true
         isDiscovering = true
         measureTask = Task { @MainActor [weak self] in
-            let (discovered, discoveries) = AsyncStream.makeStream(of: CleanupItem.self)
+            let (discovered, discoveries) = AsyncStream.makeStream(of: DiscoveryEvent.self)
             async let discovery: Void = AppModel.discover(result, scanner: scanner, into: discoveries)
-            for await item in discovered {
-                self?.append(item, generation: generation)
+            for await event in discovered {
+                switch event {
+                case let .item(item): self?.append(item, generation: generation)
+                case let .warning(line): self?.warn(line, generation: generation)
+                }
             }
             await discovery
             self?.finishDiscovering(generation: generation)
@@ -486,9 +521,13 @@ final class AppModel {
     private nonisolated static func discover(
         _ result: ScanResult,
         scanner: XcodeCleanerCore.Scanner,
-        into continuation: AsyncStream<CleanupItem>.Continuation
+        into continuation: AsyncStream<DiscoveryEvent>.Continuation
     ) async {
-        await scanner.discoverProjectCaches(for: result) { continuation.yield($0) }
+        await scanner.discoverProjectCaches(
+            for: result,
+            onDiscover: { continuation.yield(.item($0)) },
+            onWarning: { continuation.yield(.warning($0)) }
+        )
         continuation.finish()
     }
 
@@ -499,6 +538,13 @@ final class AppModel {
               scan.projectCacheItems.contains(where: { $0.id == item.id }) == false
         else { return }
         scan.projectCacheItems.append(item)
+    }
+
+    /// A root the walk gave up on, logged the way the scan's own warnings are — unless the scan it
+    /// belongs to has already been replaced.
+    private func warn(_ line: String, generation: Int) {
+        guard generation == measureGeneration else { return }
+        log("⚠︎ \(line)")
     }
 
     /// The current scan, or nil once a newer one has taken over.

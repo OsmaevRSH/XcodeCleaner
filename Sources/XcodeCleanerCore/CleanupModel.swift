@@ -150,18 +150,42 @@ public struct CachePaths: Sendable {
     /// Tuist outputs and the `.build` directories the walk looks for — is confined to these, because
     /// a mount is the whole monorepo and walking all of it is not something a cleanup tool may do.
     public let projectSearchRoots: [String]
+    /// Folders searched for `.build` directly, not per mount — what makes the app useful outside
+    /// Arcadia. Absolute, and empty unless the user picked some: walking anything by default would
+    /// be the app deciding on its own where to look on somebody's disk.
+    public let projectSearchFolders: [URL]
 
     public init(
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         applicationsDirectory: URL = URL(fileURLWithPath: "/Applications"),
-        projectSearchRoots: [String] = CachePaths.defaultProjectSearchRoots
+        projectSearchRoots: [String] = CachePaths.defaultProjectSearchRoots,
+        projectSearchFolders: [URL] = []
     ) {
         self.home = home.standardizedFileURL
         self.applicationsDirectory = applicationsDirectory.standardizedFileURL
         self.projectSearchRoots = projectSearchRoots
+        self.projectSearchFolders = projectSearchFolders.map(\.standardizedFileURL)
     }
 
     public static let defaultProjectSearchRoots = ["mobile/saft/ios", "mobile/music/ios"]
+
+    /// A path the way a person reads it: the home directory shortened to `~`, so a row reads
+    /// `~/Developer/MyLib/.build` instead of repeating `/Users/<login>` on every line. Anything
+    /// outside the home keeps its full path. Only the home itself is shortened — `/Users/tester2`
+    /// is not `~2` for a home of `/Users/tester`.
+    public static func displayPath(_ url: URL, home: URL) -> String {
+        let path = url.standardizedFileURL.path
+        let homePath = home.standardizedFileURL.path
+        if path == homePath {
+            return "~"
+        }
+        guard path.hasPrefix(homePath + "/") else { return path }
+        return "~" + path.dropFirst(homePath.count)
+    }
+
+    public func displayPath(_ url: URL) -> String {
+        Self.displayPath(url, home: home)
+    }
 
     /// The project caches that sit at a known place: Tuist writes both next to the project, and
     /// either may be missing at the moment of a scan and appear before the cleanup runs — so they

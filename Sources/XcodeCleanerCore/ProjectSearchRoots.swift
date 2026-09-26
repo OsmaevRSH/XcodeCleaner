@@ -42,4 +42,67 @@ public extension CachePaths {
     /// What surrounds a root without being part of it. Only the ends are trimmed: a directory name
     /// is allowed to contain spaces.
     private static let searchRootPadding = CharacterSet.whitespaces.union(CharacterSet(charactersIn: "/"))
+
+    /// Turns folders picked in the settings sheet, or written into `UserDefaults` by hand, into the
+    /// absolute folders the walk starts from, and says why anything was thrown away.
+    ///
+    /// Unlike a search root, a folder is not confined to a mount, so the rules are about the disk:
+    /// the path has to be absolute (after `~` is expanded against `home`), and it may not be the
+    /// whole disk or one of the system roots — walking those finds no projects, and a cleanup tool
+    /// has no business listing them. The check runs on the standardized path, so `/usr/local/..`
+    /// is `/usr`, and ignores case, as the filesystem does. Folders *inside* a system root stay
+    /// allowed: a project may live in `/opt/src`.
+    ///
+    /// Whether the folder exists is deliberately not checked: a folder on a drive that is not
+    /// plugged in right now is still the user's setting, and the scan reports it as skipped.
+    ///
+    /// Blank lines are skipped without a word, order is the user's, and a folder named twice — `~/x`
+    /// and `/Users/<login>/x/` — is kept once.
+    static func normalizedSearchFolders(
+        _ lines: [String],
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> (folders: [URL], rejected: [(line: String, reason: String)]) {
+        var folders: [URL] = []
+        var rejected: [(line: String, reason: String)] = []
+        var seen = Set<String>()
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.isEmpty == false else { continue }
+            let expanded = expandingTilde(trimmed, home: home)
+            guard expanded.hasPrefix("/") else {
+                rejected.append((line, "нужен полный путь"))
+                continue
+            }
+            let folder = URL(fileURLWithPath: expanded).standardizedFileURL
+            let path = folder.path
+            guard path != "/" else {
+                rejected.append((line, "это весь диск"))
+                continue
+            }
+            guard systemRoots.contains(path.lowercased()) == false else {
+                rejected.append((line, "системная папка"))
+                continue
+            }
+            if seen.insert(path).inserted {
+                folders.append(folder)
+            }
+        }
+        return (folders, rejected)
+    }
+
+    /// Where the system lives. Walking any of these finds no projects — and a folder this broad is
+    /// a misclick in the folder picker, not a choice.
+    private static let systemRoots: Set<String> = [
+        "/system", "/library", "/applications", "/usr", "/private", "/bin", "/sbin", "/opt",
+    ]
+
+    /// `~` and `~/…` only. `~someone/…` names another user's home, which is not where this user's
+    /// projects are, so it stays unexpanded and is rejected as not absolute.
+    private static func expandingTilde(_ path: String, home: URL) -> String {
+        if path == "~" {
+            return home.path
+        }
+        guard path.hasPrefix("~/") else { return path }
+        return home.path + path.dropFirst(1)
+    }
 }
