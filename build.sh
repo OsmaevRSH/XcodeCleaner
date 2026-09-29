@@ -2,6 +2,14 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+RESTART=false
+for arg in "$@"; do
+  case "$arg" in
+    --restart) RESTART=true ;;
+    *) print -u2 "Неизвестный аргумент: $arg (поддерживается только --restart)"; exit 2 ;;
+  esac
+done
+
 readonly APP_NAME="XcodeCleaner"
 readonly BUNDLE_ID="dev.ltheresi.xcodecleaner"
 readonly VERSION="1.0.0"
@@ -55,3 +63,19 @@ DEST="${HOME}/Desktop/${APP_NAME}.app"
 rm -rf "$DEST"
 cp -R "$APP_DIR" "$DEST"
 print "Готово: ${DEST}"
+
+if [[ "$RESTART" == true ]] && pgrep -x "$APP_NAME" >/dev/null; then
+  print "Закрываю запущенную версию…"
+  osascript -e "quit app id \"${BUNDLE_ID}\"" >/dev/null 2>&1 || true
+  for _ in {1..20}; do
+    pgrep -x "$APP_NAME" >/dev/null || break
+    sleep 0.5
+  done
+fi
+
+if pgrep -x "$APP_NAME" >/dev/null; then
+  print "${APP_NAME} уже запущен, и это старая сборка: новая откроется только после его закрытия."
+  print "Закройте его (⌘Q) и откройте ${DEST}, либо запустите ./build.sh --restart."
+else
+  open "$DEST"
+fi
